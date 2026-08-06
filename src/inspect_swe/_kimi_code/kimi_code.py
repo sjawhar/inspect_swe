@@ -47,6 +47,10 @@ from inspect_ai.util._sandbox import ExecRemoteAwaitableOptions
 
 from inspect_swe._util._async import is_callable_coroutine
 from inspect_swe._util.centaur import CentaurOptions, run_centaur
+from inspect_swe._util.mcp_ready import (
+    DEFAULT_MCP_READY_TIMEOUT,
+    wait_for_mcp_endpoints,
+)
 from inspect_swe._util.messages import build_user_prompt
 from inspect_swe._util.trace import trace
 
@@ -111,6 +115,7 @@ def kimi_code(
     skills: Sequence[str | Path | Skill] | None = None,
     mcp_servers: Sequence[MCPServerConfig] | None = None,
     bridged_tools: Sequence[BridgedToolsSpec] | None = None,
+    mcp_ready_timeout: float = DEFAULT_MCP_READY_TIMEOUT,
     centaur: bool | CentaurOptions = False,
     attempts: int | AgentAttempts = 1,
     model: str | None = None,
@@ -146,6 +151,8 @@ def kimi_code(
         skills: Additional [skills](https://inspect.aisi.org.uk/tools-standard.html#sec-skill) to make available to the agent.
         mcp_servers: MCP servers to make available to the agent
         bridged_tools: Host-side Inspect tools to expose to the agent via MCP
+        mcp_ready_timeout: Seconds to wait for bridged MCP endpoints to serve
+            tools before the agent launch errors.
         centaur: Run in 'centaur' mode, which makes Kimi Code available to an Inspect `human_cli()` agent rather than running it unattended.
         attempts: Configure agent to make multiple attempts
         model: Model name to use for inspect bridge (defaults to main model for task)
@@ -314,6 +321,33 @@ def kimi_code(
                     if has_assistant_response or attempt_count > 0:
                         agent_cmd.append("--continue")
                     agent_cmd += ["-p", agent_prompt]
+
+                    # Bridged MCP endpoints must be live BEFORE launch: this
+                    # agent reads its MCP config at startup, and the bridge
+                    # proxy starts asynchronously. Launching early yields an
+                    # agent with no bridged tools and NO error, whose output is
+                    # then scored as a valid trajectory. Raises if unreachable.
+                    _http_mcp_configs = [
+                        c
+                        for c in bridge.mcp_server_configs
+                        if isinstance(c, MCPServerConfigHTTP)
+                    ]
+                    if _http_mcp_configs:
+                        await wait_for_mcp_endpoints(
+                            _http_mcp_configs,
+                            bridge,
+                            timeout=mcp_ready_timeout,
+                            required=True,
+                        )
+
+                    # NOTE: endpoint readiness is the strongest guarantee
+                    # available for kimi: it connects MCP servers via an
+                    # unawaited asyncio task in every mode (documented as by
+                    # design) and exposes no config to block the first turn on
+                    # client connect, so a slow initialize can still race the
+                    # first model call. Claude Code closes this via
+                    # BLOCKING_MCP_ENV and codex via required=true; kimi has
+                    # no equivalent knob.
 
                     result = await sbox.exec_remote(
                         cmd=["bash", "-c", 'exec 0</dev/null; "$@"', "bash"]
