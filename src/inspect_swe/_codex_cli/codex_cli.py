@@ -35,7 +35,10 @@ from typing_extensions import Unpack
 
 from inspect_swe._util._async import is_callable_coroutine
 from inspect_swe._util.centaur import CentaurOptions, run_centaur
-from inspect_swe._util.mcp_ready import wait_for_mcp_endpoints
+from inspect_swe._util.mcp_ready import (
+    DEFAULT_MCP_READY_TIMEOUT,
+    wait_for_mcp_endpoints,
+)
 from inspect_swe._util.messages import build_user_prompt
 from inspect_swe._util.path import join_path
 from inspect_swe._util.sandbox import resolve_agent_cwd, sandbox_exec
@@ -79,6 +82,7 @@ def codex_cli(
     skills: Sequence[str | Path | Skill] | None = None,
     mcp_servers: Sequence[MCPServerConfig] | None = None,
     bridged_tools: Sequence[BridgedToolsSpec] | None = None,
+    mcp_ready_timeout: float = DEFAULT_MCP_READY_TIMEOUT,
     web_search: CodexWebSearch = "live",
     goals: bool = True,
     centaur: bool | CentaurOptions = False,
@@ -117,6 +121,8 @@ def codex_cli(
         bridged_tools: Host-side Inspect tools to expose to the agent via MCP.
             Each BridgedToolsSpec creates an MCP server that makes the specified
             tools available to the agent running in the sandbox.
+        mcp_ready_timeout: Seconds to wait for bridged MCP endpoints to serve
+            tools before the agent launch errors.
         web_search: Web search mode. Use "live" for live web search, "cached" for cached web search, or "disabled" to disable web search. Defaults to "live".
         goals: Enable Codex goal tools (defaults to `True`).
         centaur: Run in 'centaur' mode, which makes Codex CLI available to an Inspect `human_cli()` agent rather than running it unattended.
@@ -364,7 +370,10 @@ def codex_cli(
                     ]
                     if _http_mcp_configs:
                         await wait_for_mcp_endpoints(
-                            _http_mcp_configs, bridge, required=True
+                            _http_mcp_configs,
+                            bridge,
+                            timeout=mcp_ready_timeout,
+                            required=True,
                         )
 
                     result = await sbox.exec_remote(
