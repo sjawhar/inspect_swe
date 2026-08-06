@@ -376,6 +376,16 @@ def codex_cli(
                     ):
                         agent_cmd.extend(["resume", "--last"])
 
+                    # Repair ownership of everything staged above. On Modal,
+                    # sandbox.exec() ignores user= and runs as root while exec_remote()
+                    # below really does drop to `user`, so CODEX_HOME/config.toml/AGENTS.md
+                    # land root-owned and codex cannot write them. Docker and k8s honour
+                    # user=, making this a no-op there. See the commit message.
+                    if user:
+                        await sandbox_exec(
+                            sbox, cmd=f"chown -R {user} {codex_home} {agent_cwd}"
+                        )
+
                     # run agent
                     result = await sbox.exec_remote(
                         cmd=["bash", "-c", 'exec 0</dev/null; "$@"', "bash"]
