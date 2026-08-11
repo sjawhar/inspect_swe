@@ -683,45 +683,6 @@ def test_remaining_deadline_is_recomputed_per_endpoint() -> None:
     )
 
 
-def test_slow_probes_count_against_the_wall_clock_timeout() -> None:
-    """The timeout is a wall-clock deadline, not a count of sleep intervals.
-
-    The original loop accumulated only the poll interval, so time spent inside
-    a hanging probe (up to curl's --max-time per attempt) was free: a "0.2s"
-    timeout with 0.05s probes and a tiny interval could poll for minutes. The
-    deadline must include probe time, so with probes that each burn 0.05s of
-    real time this must raise after ~0.2s and, decisively, after only a
-    handful of probe attempts rather than dozens.
-    """
-    calls = 0
-
-    async def slow_never_ready(*args: Any, **kwargs: Any) -> _FakeExecResult:
-        nonlocal calls
-        calls += 1
-        await anyio.sleep(0.05)
-        return _FakeExecResult("")
-
-    sbox = AsyncMock()
-    sbox.exec = AsyncMock(side_effect=slow_never_ready)
-    bridge = _bridge_with(**{"taiga-mcp": ["browser"]})
-
-    async def run() -> bool:
-        with patch("inspect_ai.util.sandbox", return_value=sbox):
-            return await wait_for_mcp_endpoints(
-                [_http_config()], bridge=bridge, timeout=0.2, interval=0.001
-            )
-
-    with pytest.raises(MCPEndpointsUnreachableError):
-        anyio.run(run)
-    # Interval-counting semantics would need ~200 sleeps of 0.001s to trip the
-    # timeout, taking ~200 probes; deadline semantics trips after ~4 probes
-    # (0.05s each). Allow generous headroom while still failing the old loop.
-    assert calls <= 20, (
-        f"timeout ignored probe duration: {calls} probes ran, wall-clock "
-        "deadline should have stopped after ~4"
-    )
-
-
 def test_selected_agents_forward_configured_mcp_readiness_timeout() -> None:
     root = Path(__file__).parent.parent / "src" / "inspect_swe"
     # antigravity belongs here for the same reason as the others: it gates its
@@ -775,3 +736,42 @@ def test_selected_agents_forward_configured_mcp_readiness_timeout() -> None:
             )
             for call in readiness_calls
         )
+
+
+def test_slow_probes_count_against_the_wall_clock_timeout() -> None:
+    """The timeout is a wall-clock deadline, not a count of sleep intervals.
+
+    The original loop accumulated only the poll interval, so time spent inside
+    a hanging probe (up to curl's --max-time per attempt) was free: a "0.2s"
+    timeout with 0.05s probes and a tiny interval could poll for minutes. The
+    deadline must include probe time, so with probes that each burn 0.05s of
+    real time this must raise after ~0.2s and, decisively, after only a
+    handful of probe attempts rather than dozens.
+    """
+    calls = 0
+
+    async def slow_never_ready(*args: Any, **kwargs: Any) -> _FakeExecResult:
+        nonlocal calls
+        calls += 1
+        await anyio.sleep(0.05)
+        return _FakeExecResult("")
+
+    sbox = AsyncMock()
+    sbox.exec = AsyncMock(side_effect=slow_never_ready)
+    bridge = _bridge_with(**{"taiga-mcp": ["browser"]})
+
+    async def run() -> bool:
+        with patch("inspect_ai.util.sandbox", return_value=sbox):
+            return await wait_for_mcp_endpoints(
+                [_http_config()], bridge=bridge, timeout=0.2, interval=0.001
+            )
+
+    with pytest.raises(MCPEndpointsUnreachableError):
+        anyio.run(run)
+    # Interval-counting semantics would need ~200 sleeps of 0.001s to trip the
+    # timeout, taking ~200 probes; deadline semantics trips after ~4 probes
+    # (0.05s each). Allow generous headroom while still failing the old loop.
+    assert calls <= 20, (
+        f"timeout ignored probe duration: {calls} probes ran, wall-clock "
+        "deadline should have stopped after ~4"
+    )
