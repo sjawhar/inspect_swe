@@ -45,7 +45,10 @@ from inspect_swe._claude_code._events.stream import (
     claude_code_event_stream,
 )
 from inspect_swe._util.centaur import CentaurOptions, run_centaur
-from inspect_swe._util.mcp_ready import wait_for_mcp_endpoints
+from inspect_swe._util.mcp_ready import (
+    DEFAULT_MCP_READY_TIMEOUT,
+    wait_for_mcp_endpoints,
+)
 from inspect_swe._util.path import join_path
 
 from .._util._async import is_callable_coroutine
@@ -118,6 +121,7 @@ def claude_code(
     skills: Sequence[str | Path | Skill] | None = None,
     mcp_servers: Sequence[MCPServerConfig] | None = None,
     bridged_tools: Sequence[BridgedToolsSpec] | None = None,
+    mcp_ready_timeout: float = DEFAULT_MCP_READY_TIMEOUT,
     disallowed_tools: list[str] | None = None,
     centaur: bool | CentaurOptions = False,
     attempts: int | AgentAttempts = 1,
@@ -165,6 +169,8 @@ def claude_code(
         bridged_tools: Host-side Inspect tools to expose to the agent via MCP.
             Each BridgedToolsSpec creates an MCP server that makes the specified
             tools available to the agent running in the sandbox.
+        mcp_ready_timeout: Seconds to wait for bridged MCP endpoints to serve
+            tools before the agent launch errors.
         disallowed_tools: List of tool names to disallow entirely.
         centaur: Run in 'centaur' mode, which makes Claude Code available to an Inspect `human_cli()` agent rather than running it unattended.
         attempts: Configure agent to make multiple attempts. When this is specified, the task will be scored when the agent stops calling tools. If the scoring is successful, execution will stop. Otherwise, the agent will be prompted to pick up where it left off for another attempt.
@@ -384,7 +390,11 @@ def claude_code(
             # per-attempt gate below covers unattended retries after that.
             if http_mcp_configs:
                 await wait_for_mcp_endpoints(
-                    http_mcp_configs, bridge, sandbox=sandbox, required=True
+                    http_mcp_configs,
+                    bridge,
+                    sandbox=sandbox,
+                    timeout=mcp_ready_timeout,
+                    required=True,
                 )
 
             # centaur mode uses human_cli with custom instructions and bash rc
@@ -463,7 +473,11 @@ def claude_code(
                         is_retry = attempt_count > 0 or uncaught_error_count > 0
                         if http_mcp_configs and is_retry:
                             await wait_for_mcp_endpoints(
-                                http_mcp_configs, bridge, sandbox=sandbox, required=True
+                                http_mcp_configs,
+                                bridge,
+                                sandbox=sandbox,
+                                timeout=mcp_ready_timeout,
+                                required=True,
                             )
 
                         # launch Claude Code in streaming mode; drain stdout in

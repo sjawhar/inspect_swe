@@ -720,3 +720,58 @@ def test_slow_probes_count_against_the_wall_clock_timeout() -> None:
         f"timeout ignored probe duration: {calls} probes ran, wall-clock "
         "deadline should have stopped after ~4"
     )
+
+
+def test_selected_agents_forward_configured_mcp_readiness_timeout() -> None:
+    root = Path(__file__).parent.parent / "src" / "inspect_swe"
+    # antigravity belongs here for the same reason as the others: it gates its
+    # SDK launch on wait_for_mcp_endpoints, so a non-configurable timeout pins
+    # it to the default. It was omitted when this list was written, and the
+    # omission cost a 720-sample eval-set in which EVERY recorded sample died
+    # with MCPEndpointsUnreachableError after 120s -- the bridge answers in
+    # ~1s at one sample, but not while ~400 sandboxes share the runner's
+    # single event loop. Adding an agent to this dict is what makes that
+    # failure mode impossible to reintroduce silently.
+    agent_paths = {
+        "codex_cli": root / "_codex_cli" / "codex_cli.py",
+        "claude_code": root / "_claude_code" / "claude_code.py",
+        "kimi_code": root / "_kimi_code" / "kimi_code.py",
+        "antigravity": root / "_antigravity" / "antigravity.py",
+        "gemini_cli": root / "_gemini_cli" / "gemini_cli.py",
+    }
+
+    for agent_name, path in agent_paths.items():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == agent_name
+        )
+        args = function.args.args
+        timeout_index = next(
+            index for index, arg in enumerate(args) if arg.arg == "mcp_ready_timeout"
+        )
+        first_default_index = len(args) - len(function.args.defaults)
+        default = function.args.defaults[timeout_index - first_default_index]
+
+        assert isinstance(default, ast.Name)
+        assert default.id == "DEFAULT_MCP_READY_TIMEOUT"
+
+        readiness_calls = [
+            node.value
+            for node in ast.walk(function)
+            if isinstance(node, ast.Await)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "wait_for_mcp_endpoints"
+        ]
+        assert readiness_calls
+        assert all(
+            any(
+                keyword.arg == "timeout"
+                and isinstance(keyword.value, ast.Name)
+                and keyword.value.id == "mcp_ready_timeout"
+                for keyword in call.keywords
+            )
+            for call in readiness_calls
+        )
