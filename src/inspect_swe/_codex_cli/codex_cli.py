@@ -74,6 +74,12 @@ from .model_catalog import (
 
 logger = getLogger(__file__)
 
+# Seconds codex waits for an MCP server to come up before giving up on it and
+# running the agent without its tools. Codex's own default sits far below the
+# startup time of a sandboxed server on a loaded host, and exceeding it fails
+# SILENTLY -- the agent is simply handed no tools (see the call site).
+MCP_STARTUP_TIMEOUT_SEC = 300
+
 
 @agent
 def codex_cli(
@@ -338,9 +344,14 @@ def codex_cli(
             all_mcp_servers = list(mcp_servers or []) + bridge.mcp_server_configs
             if all_mcp_servers:
                 for mcp_server in all_mcp_servers:
-                    toml_config[f"mcp_servers.{mcp_server.name}"] = (
-                        codex_mcp_server_config(mcp_server, bridged_server_names)
+                    server_toml = codex_mcp_server_config(
+                        mcp_server, bridged_server_names
                     )
+                    # setdefault, so an author who sets it explicitly still wins.
+                    server_toml.setdefault(
+                        "startup_timeout_sec", MCP_STARTUP_TIMEOUT_SEC
+                    )
+                    toml_config[f"mcp_servers.{mcp_server.name}"] = server_toml
 
             # model provider (use a custom provider name so we can set
             # stream_idle_timeout_ms -- built-in providers can't be overridden)

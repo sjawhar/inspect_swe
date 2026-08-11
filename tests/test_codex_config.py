@@ -261,3 +261,25 @@ def test_static_mcp_server_is_not_marked_required() -> None:
     config = codex_mcp_server_config(server, {"bridged-tools"})
 
     assert "required" not in config
+
+
+def test_bridged_mcp_servers_get_a_generous_startup_timeout() -> None:
+    """Codex must not give up on a slow-starting MCP server and run toolless.
+
+    Codex awaits its MCP tool list at session start, but the wait is bounded by a
+    per-server `startup_timeout_sec`. Nothing set it, so codex used its built-in
+    default; when a sandboxed server took longer, codex proceeded with the server
+    FAILED and the agent had no environment tools. It then did nothing, and the
+    empty trajectory was SCORED with no error to retry on -- measured at 2.4% of
+    250 samples at 150-way concurrency, and 87/4130 across a production
+    collection.
+
+    Asserts the value is large enough to cover a slow sandbox boot; a small
+    default is exactly the bug.
+    """
+    from inspect_swe._codex_cli.codex_cli import MCP_STARTUP_TIMEOUT_SEC
+
+    assert MCP_STARTUP_TIMEOUT_SEC >= 120, (
+        "startup timeout must exceed realistic sandboxed MCP startup time, or "
+        "codex silently runs the agent with no environment tools"
+    )
