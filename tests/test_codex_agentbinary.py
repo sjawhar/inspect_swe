@@ -2,18 +2,29 @@
 
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from typing import cast
+from unittest.mock import AsyncMock, call, patch
 
 import anyio
 import pytest
+from inspect_ai.util import SandboxEnvironment
 from inspect_swe._codex_cli import agentbinary
 from inspect_swe._codex_cli._bundled_catalog import BUNDLED_CODEX_CATALOG
 from inspect_swe._codex_cli.model_catalog import latest_openai_slug
+from inspect_swe._util import agentbinary as install_agentbinary
+from inspect_swe._util.agentbinary import ensure_agent_binary_installed
 from inspect_swe._util.download import download_text_file
+from inspect_swe._util.sandbox import SANDBOX_INSTALL_DIR
 
 from tests.conftest import skip_if_github_action
 
 _CATALOG_JSON = json.dumps({"models": [{"slug": "gpt-5.5", "priority": 0}]})
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
 
 
 def test_codex_models_catalog_none_version_uses_bundled() -> None:
@@ -63,6 +74,101 @@ def test_codex_models_catalog_falls_back_to_bundled_on_fetch_error(
         catalog = anyio.run(agentbinary.codex_models_catalog, "9.9.9")
         assert catalog is BUNDLED_CODEX_CATALOG
         assert not cache_file.exists()
+
+
+@pytest.mark.anyio
+async def test_codex_install_writes_code_mode_host_adjacent_to_codex() -> None:
+    # Given
+    version = "0.147.0"
+    arch = "x86_64-unknown-linux-musl"
+    codex_url = "https://downloads.example/codex.tar.gz"
+    host_url = "https://downloads.example/codex-code-mode-host.tar.gz"
+    release = json.dumps(
+        {
+            "assets": [
+                {
+                    "name": f"codex-{arch}.tar.gz",
+                    "digest": f"sha256:{'a' * 64}",
+                    "browser_download_url": codex_url,
+                },
+                {
+                    "name": f"codex-code-mode-host-{arch}.tar.gz",
+                    "digest": f"sha256:{'b' * 64}",
+                    "browser_download_url": host_url,
+                },
+            ]
+        }
+    )
+    write_file = AsyncMock()
+    sandbox = cast(
+        SandboxEnvironment, cast(object, SimpleNamespace(write_file=write_file))
+    )
+    codex_path = f"{SANDBOX_INSTALL_DIR}/codex-{version}-linux-x64"
+    host_path = f"{SANDBOX_INSTALL_DIR}/codex-code-mode-host"
+
+    def extract_archive(archive: bytes) -> bytes:
+        return b"extracted-" + archive
+
+    with (
+        patch.object(
+            agentbinary, "download_text_file", AsyncMock(return_value=release)
+        ),
+        patch.object(agentbinary, "extract_tarball", side_effect=extract_archive),
+        patch.object(
+            install_agentbinary,
+            "download_file",
+            AsyncMock(side_effect=[b"codex", b"code-mode-host"]),
+        ),
+        patch.object(install_agentbinary, "verify_checksum", return_value=True),
+        patch.object(
+            install_agentbinary,
+            "detect_sandbox_platform",
+            AsyncMock(return_value="linux-x64"),
+        ),
+        patch.object(install_agentbinary, "read_cached_binary", return_value=None),
+        patch.object(install_agentbinary, "write_cached_binary"),
+        patch.object(install_agentbinary, "_resolved_versions", {}),
+        patch.object(install_agentbinary, "trace"),
+        patch.object(install_agentbinary, "sandbox_exec", AsyncMock()) as execute,
+    ):
+        source = agentbinary.codex_cli_binary_source()
+
+        # When
+        installed = await ensure_agent_binary_installed(
+            source, version=version, sandbox=sandbox
+        )
+
+    # Then
+    assert installed == codex_path
+    write_file.assert_has_awaits(
+        [
+            call(codex_path, b"extracted-codex"),
+            call(host_path, b"extracted-code-mode-host"),
+        ]
+    )
+    assert execute.await_args_list == [
+        call(sandbox, f"chmod +x {codex_path}", user="root"),
+        call(sandbox, f"chmod +x {host_path}", user="root"),
+    ]
+
+
+def test_agentbinary_installation_api_is_public() -> None:
+    # Given
+    from inspect_swe import (
+        claude_code_binary_source,
+        codex_cli_binary_source,
+        ensure_agent_binary_installed,
+    )
+
+    # When
+    public_api = (
+        ensure_agent_binary_installed,
+        claude_code_binary_source,
+        codex_cli_binary_source,
+    )
+
+    # Then
+    assert all(callable(symbol) for symbol in public_api)
 
 
 @skip_if_github_action

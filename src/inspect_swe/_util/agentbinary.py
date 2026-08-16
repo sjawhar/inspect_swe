@@ -23,6 +23,14 @@ class AgentBinaryVersion(NamedTuple):
     version: str
     expected_checksum: str
     download_url: str
+    additional_binaries: tuple["AgentBinaryAdditional", ...] = ()
+
+
+class AgentBinaryAdditional(NamedTuple):
+    binary: str
+    expected_checksum: str
+    download_url: str
+    post_download: Callable[[bytes], bytes] | None
 
 
 @dataclass
@@ -37,6 +45,7 @@ class AgentBinarySource:
     list_cached_binaries: Callable[[], list[Path]]
     post_download: Callable[[bytes], bytes] | None
     post_install: str | None
+    additional_binary_names: tuple[str, ...] = ()
 
 
 # In-process cache for version resolution results. When many samples run
@@ -82,23 +91,52 @@ async def ensure_agent_binary_installed(
 
     # use concurrency so multiple samples don't attempt the same download all at once
     async with concurrency(f"{source.binary}-install", 1, visible=False):
-        # if a specific version is requested, first try to read it directly from the cache
+        additional_binary_data: tuple[tuple[str, bytes], ...] = ()
         if version not in ["stable", "latest"]:
             binary_bytes: bytes | None = read_cached_binary(
                 source, version, platform, None
             )
             if binary_bytes is not None:
-                trace(f"Used {source.agent} binary from cache: {version} ({platform})")
+                primary_cache_path = source.cached_binary_path(version, platform)
+                cached_additional_binary_data: list[tuple[str, bytes]] = []
+                for additional_name in source.additional_binary_names:
+                    additional_bytes = _read_cached_additional_binary(
+                        _additional_binary_cache_path(
+                            source, primary_cache_path, additional_name
+                        )
+                    )
+                    if additional_bytes is None:
+                        binary_bytes = None
+                        break
+                    cached_additional_binary_data.append(
+                        (additional_name, additional_bytes)
+                    )
+                if binary_bytes is not None:
+                    additional_binary_data = tuple(cached_additional_binary_data)
+                    trace(
+                        f"Used {source.agent} binary from cache: {version} ({platform})"
+                    )
         else:
             binary_bytes = None
 
-        # download the binary
         if binary_bytes is None:
-            binary_bytes, resolved_version = await download_agent_binary_async(
+            binary_bytes, resolved = await download_agent_binary_async(
                 source, version, platform, trace
             )
+            resolved_version = resolved.version
+            primary_cache_path = source.cached_binary_path(resolved_version, platform)
+            downloaded_additional_binary_data: list[tuple[str, bytes]] = []
+            for additional_binary in resolved.additional_binaries:
+                downloaded_additional_binary_data.append(
+                    (
+                        additional_binary.binary,
+                        await _download_additional_binary(
+                            source, primary_cache_path, additional_binary
+                        ),
+                    )
+                )
+            additional_binary_data = tuple(downloaded_additional_binary_data)
         else:
-            # If we got it from cache, version is already the resolved version
             resolved_version = version
 
         # write it into the container and return it
@@ -107,6 +145,10 @@ async def ensure_agent_binary_installed(
         )
         await sandbox.write_file(binary_path, binary_bytes)
         await sandbox_exec(sandbox, f"chmod +x {binary_path}", user="root")
+        for additional_name, additional_bytes in additional_binary_data:
+            additional_path = f"{SANDBOX_INSTALL_DIR}/{additional_name}"
+            await sandbox.write_file(additional_path, additional_bytes)
+            await sandbox_exec(sandbox, f"chmod +x {additional_path}", user="root")
         if source.post_install:
             await sandbox_exec(
                 sandbox, f"{binary_path} {source.post_install}", user=user
@@ -114,12 +156,54 @@ async def ensure_agent_binary_installed(
         return binary_path
 
 
+async def _download_additional_binary(
+    source: AgentBinarySource,
+    primary_cache_path: Path,
+    additional_binary: AgentBinaryAdditional,
+) -> bytes:
+    cache_path = _additional_binary_cache_path(
+        source, primary_cache_path, additional_binary.binary
+    )
+    cached_binary = _read_cached_additional_binary(cache_path)
+    if cached_binary is not None:
+        return cached_binary
+
+    binary_data = await download_file(additional_binary.download_url)
+    if not verify_checksum(binary_data, additional_binary.expected_checksum):
+        raise ValueError("Checksum verification failed")
+    if additional_binary.post_download is not None:
+        binary_data = additional_binary.post_download(binary_data)
+    _write_cached_additional_binary(cache_path, binary_data)
+    return binary_data
+
+
+def _additional_binary_cache_path(
+    source: AgentBinarySource, primary_cache_path: Path, binary: str
+) -> Path:
+    suffix = primary_cache_path.name.removeprefix(f"{source.binary}-")
+    return primary_cache_path.with_name(f"{binary}-{suffix}")
+
+
+def _read_cached_additional_binary(cache_path: Path) -> bytes | None:
+    if not cache_path.exists():
+        return None
+    with open(cache_path, "rb") as cache_file:
+        binary_data = cache_file.read()
+    cache_path.touch()
+    return binary_data
+
+
+def _write_cached_additional_binary(cache_path: Path, binary_data: bytes) -> None:
+    with open(cache_path, "wb") as cache_file:
+        cache_file.write(binary_data)
+
+
 async def download_agent_binary_async(
     source: AgentBinarySource,
     version: Literal["stable", "latest"] | str,
     platform: SandboxPlatform,
     logger: Callable[[str], None] | None = None,
-) -> tuple[bytes, str]:
+) -> tuple[bytes, AgentBinaryVersion]:
     # resolve logger
     logger = logger or print
 
@@ -134,7 +218,9 @@ async def download_agent_binary_async(
         resolved = await source.resolve_version(version, platform)
         with _resolve_version_lock:
             _resolved_versions[cache_key] = resolved
-    version, expected_checksum, download_url = resolved
+    version = resolved.version
+    expected_checksum = resolved.expected_checksum
+    download_url = resolved.download_url
 
     # check the cache (if post_download is used, don't verify checksum since cached is processed)
     cache_checksum = None if source.post_download else expected_checksum
@@ -158,7 +244,7 @@ async def download_agent_binary_async(
         logger(f"Used {source.agent} binary from cache: {version} ({platform})")
 
     # return data and resolved version
-    return binary_data, version
+    return binary_data, resolved
 
 
 def read_cached_binary(

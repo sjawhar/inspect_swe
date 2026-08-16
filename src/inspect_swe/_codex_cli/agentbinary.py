@@ -7,7 +7,11 @@ from typing import Any
 from inspect_ai.util import SandboxEnvironment, concurrency
 from typing_extensions import Literal
 
-from .._util.agentbinary import AgentBinarySource, AgentBinaryVersion
+from .._util.agentbinary import (
+    AgentBinaryAdditional,
+    AgentBinarySource,
+    AgentBinaryVersion,
+)
 from .._util.appdirs import package_cache_dir
 from .._util.download import download_text_file
 from .._util.sandbox import SandboxPlatform, sandbox_exec
@@ -30,38 +34,31 @@ def codex_cli_binary_source() -> AgentBinarySource:
         # Get release information
         release = await _fetch_release_assets(version)
 
-        # Get the platform-specific asset
         arch = _platform_to_codex_arch(platform)
-        asset_name = f"codex-{arch}.tar.gz"
+        codex_asset = _release_asset(release, f"codex-{arch}.tar.gz", platform)
+        host_asset = _release_asset(
+            release, f"codex-code-mode-host-{arch}.tar.gz", platform
+        )
 
-        # Find the matching asset
-        asset = None
-        for a in release.get("assets", []):
-            if a["name"] == asset_name:
-                asset = a
-                break
-
-        if asset is None:
-            raise RuntimeError(
-                f"No asset found for platform {platform} in version {version}"
-            )
-
-        # Extract checksum (format: "sha256:xxx")
-        digest = asset.get("digest", "")
-        if not digest.startswith("sha256:"):
-            raise RuntimeError(f"Invalid digest format: {digest}")
-        expected_checksum = digest[7:]  # Remove "sha256:" prefix
-
-        # Get download URL
-        download_url = asset["browser_download_url"]
-
-        return AgentBinaryVersion(version, expected_checksum, download_url)
+        return AgentBinaryVersion(
+            version,
+            _asset_checksum(codex_asset),
+            codex_asset["browser_download_url"],
+            (
+                AgentBinaryAdditional(
+                    "codex-code-mode-host",
+                    _asset_checksum(host_asset),
+                    host_asset["browser_download_url"],
+                    extract_tarball,
+                ),
+            ),
+        )
 
     def cached_binary_path(version: str, platform: SandboxPlatform) -> Path:
         return cached_binary_dir / f"codex-{version}-{platform}"
 
     def list_cached_binaries() -> list[Path]:
-        return list(cached_binary_dir.glob("codex-*"))
+        return list(cached_binary_dir.glob("codex-[0-9]*"))
 
     return AgentBinarySource(
         agent="codex cli",
@@ -71,6 +68,7 @@ def codex_cli_binary_source() -> AgentBinarySource:
         list_cached_binaries=list_cached_binaries,
         post_download=extract_tarball,
         post_install=None,
+        additional_binary_names=("codex-code-mode-host",),
     )
 
 
@@ -89,6 +87,31 @@ def _platform_to_codex_arch(platform: SandboxPlatform) -> str:
     if platform not in platform_map:
         raise ValueError(f"Unsupported platform: {platform}")
     return platform_map[platform]
+
+
+def _release_asset(
+    release: dict[str, Any], asset_name: str, platform: SandboxPlatform
+) -> dict[str, str]:
+    for asset in release.get("assets", []):
+        if not isinstance(asset, dict):
+            continue
+        name = asset.get("name")
+        digest = asset.get("digest")
+        download_url = asset.get("browser_download_url")
+        if name == asset_name:
+            if not isinstance(digest, str):
+                raise RuntimeError(f"Invalid digest format: {digest}")
+            if not isinstance(download_url, str):
+                raise RuntimeError(f"Invalid download URL: {download_url}")
+            return {"digest": digest, "browser_download_url": download_url}
+    raise RuntimeError(f"No asset named {asset_name} found for platform {platform}")
+
+
+def _asset_checksum(asset: dict[str, str]) -> str:
+    digest = asset["digest"]
+    if not digest.startswith("sha256:"):
+        raise RuntimeError(f"Invalid digest format: {digest}")
+    return digest[7:]
 
 
 async def _fetch_latest_stable_version() -> str:
