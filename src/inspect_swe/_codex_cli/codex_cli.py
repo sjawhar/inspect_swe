@@ -34,7 +34,7 @@ from inspect_ai.util._sandbox import ExecRemoteAwaitableOptions
 from typing_extensions import Unpack
 
 from inspect_swe._util._async import is_callable_coroutine
-from inspect_swe._util.centaur import CentaurOptions, run_centaur
+from inspect_swe._util.centaur import CentaurOptions, CommandsFilter, run_centaur
 from inspect_swe._util.mcp_ready import (
     DEFAULT_MCP_READY_TIMEOUT,
     wait_for_mcp_endpoints,
@@ -102,9 +102,11 @@ def codex_cli(
     goals: bool = True,
     auto_review: bool | CodexAutoReview = False,
     centaur: bool | CentaurOptions = False,
+    commands_filter: CommandsFilter | None = None,
     attempts: int | AgentAttempts = 1,
     model: str | None = None,
     model_aliases: dict[str, str | Model] | None = None,
+    transparent_proxy: bool = False,
     filter: GenerateFilter | None = None,
     retry_refusals: int | None = None,
     home_dir: str | None = None,
@@ -156,11 +158,23 @@ def codex_cli(
             Pass `CodexAutoReview` to customize the guardian policy and model.
             Requires Codex CLI >= 0.137.0. Defaults to `False`.
         centaur: Run in 'centaur' mode, which makes Codex CLI available to an Inspect `human_cli()` agent rather than running it unattended.
+        commands_filter: In centaur mode only, filter or augment the human agent's
+            command list (e.g. to add task-specific commands). Ignored outside centaur mode.
         attempts: Configure agent to make multiple attempts. When this is specified, the task will be scored when the agent stops calling tools. If the scoring is successful, execution will stop. Otherwise, the agent will be prompted to pick up where it left off for another attempt.
         model: Model name to use (defaults to main model for task).
         model_aliases: Optional mapping of model names to Model instances or model name strings.
             Allows using custom Model implementations (e.g., wrapped Agents) instead of standard models.
             When a model name in the mapping is referenced, the corresponding Model/string is used.
+        transparent_proxy: Run the bridge as a faithful transparent proxy (defaults
+            to `False`). When `True`, each request is routed to the model the agent
+            actually asked for -- no alias table and no fallback collapse onto the
+            session model -- and the client's generation parameters are treated as
+            authoritative. Required when the agent makes internal model calls of its
+            own that must reach their real provider model rather than being served by
+            the session model, e.g. Codex's `auto_review` reviewer (`codex-auto-review`)
+            under `approval_policy="on-request"`. With the default `False`, such a
+            request falls through to the fallback model, so the reviewer is silently
+            served by the session model instead of OpenAI's reviewer.
         filter: Filter for intercepting bridged model requests.
         retry_refusals: Should refusals be retried? (pass number of times to retry)
         home_dir: Home directory to use for codex cli. If set, AGENTS.md, skills, and the MCP configuration will be written here.
@@ -349,10 +363,13 @@ def codex_cli(
             checkpointer() as cp,
             sandbox_agent_bridge(
                 state,
-                model=bridge_model,
-                model_aliases=resolve_codex_auto_review_model_aliases(
+                model=None if transparent_proxy else bridge_model,
+                model_aliases=None
+                if transparent_proxy
+                else resolve_codex_auto_review_model_aliases(
                     resolved_auto_review, model_aliases
                 ),
+                forward_generation_config=transparent_proxy,
                 filter=filter,
                 sandbox=sandbox,
                 retry_refusals=retry_refusals,
@@ -632,6 +649,8 @@ def codex_cli(
                     codex_cmd=cmd,
                     agent_env=agent_env,
                     state=state,
+                    user=user,
+                    commands_filter=commands_filter,
                 )
             else:
                 # execute the agent (track debug output)
@@ -783,6 +802,8 @@ async def _run_codex_cli_centaur(
     codex_cmd: list[str],
     agent_env: dict[str, str],
     state: AgentState,
+    user: str | None = None,
+    commands_filter: CommandsFilter | None = None,
 ) -> None:
     instructions = "Codex CLI:\n\n - You may also use Codex CLI via the 'codex' command.\n - Use 'codex resume' if you need to resume a previous codex session."
 
@@ -793,7 +814,9 @@ async def _run_codex_cli_centaur(
     bashrc = "\n".join(agent_env_vars + ["", alias_cmd])
 
     # run the human cli
-    await run_centaur(options, instructions, bashrc, state)
+    await run_centaur(
+        options, instructions, bashrc, state, user=user, commands_filter=commands_filter
+    )
 
 
 async def _last_rollout(
