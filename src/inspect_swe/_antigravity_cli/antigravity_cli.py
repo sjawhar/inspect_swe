@@ -1,4 +1,5 @@
 import json
+import re
 import shlex
 from pathlib import Path
 from textwrap import dedent
@@ -395,16 +396,43 @@ def build_antigravity_mcp_config(mcp_servers: Sequence[MCPServerConfig]) -> str:
     return json.dumps({"mcpServers": servers}, indent=2)
 
 
+# Opaque base64 payloads the CLI prints on stdout -- Gemini thought signatures,
+# emitted one per reasoning turn. They carry no diagnostic text, and a long run
+# emits enough of them to fill any error budget, so they are replaced by a short
+# placeholder before truncation rather than being allowed to evict the real
+# message. 200 chars is well above any base64 token that might carry meaning and
+# well below the ~2KB signatures.
+_OPAQUE_BLOB = re.compile(r"[A-Za-z0-9+/]{200,}={0,2}")
+_MAX_ERROR_LEN = 20000
+
+
 def _clean_antigravity_error(stdout: str, stderr: str) -> str:
-    """Trim the CLI's failure output down to something readable in a traceback."""
-    combined = f"{stdout}\n{stderr}"
-    cleaned_lines = [
-        line for line in combined.split("\n") if not line.strip().startswith("<think")
+    """Trim the CLI's failure output down to something readable in a traceback.
+
+    stderr is placed FIRST and stdout second: the CLI reports its actual failure
+    reason on stderr (e.g. "Error: timeout waiting for response") while stdout
+    carries the reasoning stream. Concatenating stdout first pushed every real
+    error past the truncation limit, so a failed run surfaced as a wall of
+    base64 with no cause in it.
+    """
+
+    def scrub(text: str) -> str:
+        kept = [
+            line for line in text.split("\n") if not line.strip().startswith("<think")
+        ]
+        return _OPAQUE_BLOB.sub(
+            lambda match: f"<{len(match.group(0))}-char opaque payload>",
+            "\n".join(kept),
+        ).strip()
+
+    sections = [
+        f"{label}:\n{body}"
+        for label, body in (("STDERR", scrub(stderr)), ("STDOUT", scrub(stdout)))
+        if body
     ]
-    cleaned = "\n".join(cleaned_lines).strip()
-    max_len = 2000
-    if len(cleaned) > max_len:
-        cleaned = cleaned[:max_len] + "... (truncated)"
+    cleaned = "\n\n".join(sections).strip()
+    if len(cleaned) > _MAX_ERROR_LEN:
+        cleaned = cleaned[:_MAX_ERROR_LEN] + "... (truncated)"
     return cleaned if cleaned else "Unknown error (no output)"
 
 
