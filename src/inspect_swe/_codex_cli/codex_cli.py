@@ -168,20 +168,21 @@ def codex_cli(
         model_aliases: Optional mapping of model names to Model instances or model name strings.
             Allows using custom Model implementations (e.g., wrapped Agents) instead of standard models.
             When a model name in the mapping is referenced, the corresponding Model/string is used.
-        transparent_proxy: Bind the `auto_review` guardian slug
-            (`codex-auto-review`) to the real target model even when
-            `auto_review` doesn't configure its own `model`, and forward the
-            client's generation parameters as authoritative instead of merging
-            in the eval's active `GenerateConfig` (defaults to `False`). Codex
-            hardcodes that guardian slug into every reviewer request
-            regardless of configuration, so without this the request has no
-            alias, falls through to the session model instead of the intended
-            guardian, and the guardian's own generation parameters (e.g.
-            `max_tokens`) are dropped. Required for `auto_review=True` with
-            `approval_policy="on-request"` when no explicit
-            `CodexAutoReview(model=...)` is set. The ordinary bridged request
-            (Codex's own `--model` slug) is unaffected -- it keeps resolving
-            to the real target model exactly as it does with `transparent_proxy=False`.
+        transparent_proxy: Run the bridge as a faithful proxy (defaults to
+            `False`): every request reaches the model Codex named, with the
+            client's generation parameters forwarded as authoritative instead
+            of merged with the eval's active `GenerateConfig`. No fallback
+            model is installed, so a name the alias table does not know is
+            resolved by the bridge from the request itself rather than being
+            redirected to the session model. This is what lets Codex's
+            `auto_review` guardian run on OpenAI's reviewer: Codex hardcodes
+            the guardian slug (`codex-auto-review`) into every reviewer
+            request regardless of configuration, and with a fallback in place
+            that un-aliased request is redirected to the session model -- the
+            agent reviewing itself. Requires a bridge that resolves bare model
+            names by endpoint provider (Codex sends its own `--model` slug
+            unprefixed too); on a bridge without that, bare names fail to
+            resolve, which is why the default keeps the fallback.
         filter: Filter for intercepting bridged model requests.
         retry_refusals: Should refusals be retried? (pass number of times to retry)
         home_dir: Home directory to use for codex cli. If set, AGENTS.md, skills, and the MCP configuration will be written here.
@@ -370,11 +371,9 @@ def codex_cli(
             checkpointer() as cp,
             sandbox_agent_bridge(
                 state,
-                model=bridge_model,
+                model=None if transparent_proxy else bridge_model,
                 model_aliases=resolve_codex_auto_review_model_aliases(
-                    resolved_auto_review,
-                    model_aliases,
-                    default=get_model(model) if transparent_proxy else None,
+                    resolved_auto_review, model_aliases
                 ),
                 forward_generation_config=transparent_proxy,
                 filter=filter,
