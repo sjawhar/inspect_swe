@@ -1,49 +1,24 @@
-"""Bridge `ModelEventSink` for Codex CLI sub-agent spans (bridge-only).
+"""Bridge `ModelEventSink` for Codex CLI sub-agent spans.
 
-Installed on the agent bridge so the bridge hands us every `ModelEvent` for
-routing instead of emitting it to the transcript itself. From those events alone
-(no Codex `--json` stdout parsing) we reconstruct the agent-span tree:
+The sink opens spans from a parent's native `spawn_agent` tool call and binds
+the returned Codex thread ID to that exact tool-call ID. `close_agent`,
+completion notifications, and `reset()` close those spans through the same
+native IDs.
 
-  1. **Open** (race-free) — when a parent's output contains `spawn_agent`
-     tool-calls, `on_complete` opens an agent `SpanBeginEvent` for each, keyed by
-     the spawn tool-call id, and registers the spawn prompt for attribution. This
-     happens synchronously before the bridge response is returned, so the spans
-     are open before any sub-agent can make its first call.
+The consumer has no verified child thread ID in a bridge `ModelEvent`. It
+therefore does not reconstruct an identity by matching the child prompt. While
+child spans are open, unidentifiable model events remain unscoped instead of
+being silently attributed to the parent.
 
-  2. **Attribute** — `on_pending` resolves each call's span by substring-matching
-     its user-message text against the open spawn prompts. Codex re-sends a
-     sub-agent's spawn prompt as a user message on every request, so this works
-     for every call (not just the first). Zero/multiple matches → outer span.
-
-  3. **Bind thread id** — the `spawn_agent` tool *result* carries the sub-agent's
-     `agent_id` (thread id), correlated to the spawn call by `tool_call_id`. We
-     harvest it from `event.input` so spans can be closed by thread id.
-
-  4. **Close** — on a `close_agent` tool-call (`target=thread_id`) and on any
-     `status:completed` notification for a thread id (whichever comes first).
-     `reset()` closes orphans between attempts and at the end.
-
-Compaction: our custom bridge provider forces Codex's *local* compaction, a
-normal `/v1/responses` call carrying `COMPACTION_MARKER`. We detect it in
-`on_pending` and emit a `CompactionEvent` on the attributed span.
-
-Concurrency: attribution is per-request (keyed on the call's own prompt, not
-wall-clock state), so parallel sub-agents are handled correctly — each call
-routes to its own span regardless of interleaving, and each thread binds/closes
-independently via its unique spawn `tool_call_id`.
+Codex's bridge-local compaction marker is emitted as a `CompactionEvent`.
 """
 
 from dataclasses import dataclass
-from logging import getLogger
 
 from inspect_ai.event import CompactionEvent, SpanBeginEvent, SpanEndEvent
 from inspect_ai.event._model import ModelEvent
 from inspect_ai.log import transcript
-from inspect_ai.model._chat_message import (
-    ChatMessage,
-    ChatMessageTool,
-    ChatMessageUser,
-)
+from inspect_ai.model._chat_message import ChatMessage, ChatMessageTool
 from inspect_ai.model._model import ModelEventSink
 from inspect_ai.util._span import current_span_id
 
@@ -56,13 +31,6 @@ from .detection import (
 )
 from .toolview import tool_view
 
-logger = getLogger(__name__)
-
-
-# Minimum spawn-prompt length to consider for substring matching, guarding
-# against short prompts accidentally matching unrelated content.
-_MIN_PROMPT_LENGTH = 16
-
 
 @dataclass
 class _OpenAgent:
@@ -70,7 +38,6 @@ class _OpenAgent:
 
     call_id: str
     span_id: str
-    prompt: str
     thread_id: str | None = None
 
 
@@ -122,8 +89,8 @@ class CodexConsumer(ModelEventSink):
         for thread_id in completed_thread_ids(event.input):
             self._close_thread(thread_id)
 
-        # attribute this call to a span
-        span_id = self._attribute(event.input)
+        # Preserve parent attribution only when no child span is active.
+        span_id = self._attribute()
         event.span_id = span_id
 
         # compaction summarization call → emit a marker on the same span
@@ -160,7 +127,6 @@ class CodexConsumer(ModelEventSink):
                 self._agents[spawned.call_id] = _OpenAgent(
                     call_id=spawned.call_id,
                     span_id=span_id,
-                    prompt=spawned.message,
                 )
                 metadata: dict[str, str] = {"agent_type": spawned.agent_type}
                 if spawned.reasoning_effort:
@@ -211,41 +177,14 @@ class CodexConsumer(ModelEventSink):
             return
         transcript()._event(SpanEndEvent(id=agent.span_id))
 
-    def _attribute(self, input_messages: list[ChatMessage]) -> str | None:
-        """Resolve the span_id for an incoming bridge call.
+    def _attribute(self) -> str | None:
+        """Resolve a bridge call without reconstructing child identity.
 
-        Substring-matches the call's user-message text against open spawn
-        prompts. Exactly one match → that sub-agent's span; zero/multiple →
-        outer span (defensive default).
+        A Codex thread ID is available to native lifecycle tools, but is not
+        included in the child `ModelEvent`. Leaving concurrent child work
+        unscoped prevents overlapping spawn prompts from merging into the
+        parent span.
         """
-        if not self._agents:
-            return self.outer_span_id
-
-        user_text = self._user_text(input_messages)
-        if not user_text:
-            return self.outer_span_id
-
-        matches = [
-            agent
-            for agent in self._agents.values()
-            if len(agent.prompt) >= _MIN_PROMPT_LENGTH and agent.prompt in user_text
-        ]
-        if len(matches) == 1:
-            return matches[0].span_id
+        if self._agents:
+            return None
         return self.outer_span_id
-
-    @staticmethod
-    def _user_text(input_messages: list[ChatMessage]) -> str:
-        """Concatenated text of user messages used for attribution.
-
-        Excludes `<subagent_notification>` messages: those appear in a *parent's*
-        input and carry sub-agent *answers* (not spawn prompts), which could
-        otherwise cause a parent call to false-match a sub-agent span.
-        """
-        return "\n".join(
-            msg.text
-            for msg in input_messages
-            if isinstance(msg, ChatMessageUser)
-            and msg.text
-            and "<subagent_notification>" not in msg.text
-        )
