@@ -7,6 +7,8 @@ from unittest.mock import patch
 import anyio
 import pytest
 from inspect_ai.event import CompactionEvent, SpanBeginEvent, SpanEndEvent
+from inspect_ai.event._model import ModelEvent
+from inspect_ai.model import BRIDGE_REQUEST_HEADERS, GenerateConfig, ModelOutput
 
 import inspect_swe._gemini_cli._events.consumer as consumer_module
 from inspect_swe._gemini_cli._events.consumer import GeminiConsumer
@@ -47,6 +49,32 @@ def _span(
     if parent_span_id is not None:
         record["parentSpanContext"] = {"spanId": parent_span_id}
     return record
+
+_TRACE_ID = "0123456789abcdef0123456789abcdef"
+_MODEL_SPAN_ID = "0123456789abcdef"
+
+
+def _traceparent(trace_id: str = _TRACE_ID, span_id: str = _MODEL_SPAN_ID) -> str:
+    return f"00-{trace_id}-{span_id}-01"
+
+
+def _bridge_model_event(
+    headers: dict[str, object] | None,
+) -> ModelEvent:
+    metadata = (
+        {BRIDGE_REQUEST_HEADERS: headers}
+        if headers is not None
+        else None
+    )
+    return ModelEvent(
+        model="mock/model",
+        input=[],
+        tools=[],
+        tool_choice="none",
+        config=GenerateConfig(),
+        output=ModelOutput.from_content("mock/model", "done"),
+        metadata=metadata,
+    )
 
 
 
@@ -762,3 +790,116 @@ def test_refresh_drains_before_a_native_score_command() -> None:
 
     assert sandbox.paths == ["/home/agent/.gemini/inspect-swe.otel.json"]
     assert len(recorder.events) == 9
+
+
+def test_bridge_event_waits_for_exact_native_model_span_before_emission() -> None:
+    recorder = _TranscriptRecorder()
+    consumer = GeminiConsumer()
+    event = _bridge_model_event({"traceparent": _traceparent()})
+    native_model = _span(
+        _MODEL_SPAN_ID,
+        None,
+        name="llm_call",
+        operation="llm_call",
+        start=100,
+        end=101,
+        trace_id=_TRACE_ID,
+    )
+
+    with (
+        patch.object(consumer_module, "transcript", return_value=recorder),
+        patch.object(consumer_module, "current_span_id", return_value="outer-span"),
+    ):
+        consumer.on_pending(event)
+        consumer.on_complete(event)
+        assert recorder.events == []
+        consumer.process_telemetry(json.dumps(native_model))
+
+    assert event.span_id == _MODEL_SPAN_ID
+    assert recorder.events[-1] is event
+    assert recorder.events.count(event) == 1
+
+
+def test_bridge_event_emitted_before_completion_is_updated() -> None:
+    recorder = _TranscriptRecorder()
+    consumer = GeminiConsumer()
+    event = _bridge_model_event({"traceparent": _traceparent()})
+    native_model = _span(
+        _MODEL_SPAN_ID,
+        None,
+        name="llm_call",
+        operation="llm_call",
+        start=100,
+        end=101,
+        trace_id=_TRACE_ID,
+    )
+
+    with (
+        patch.object(consumer_module, "transcript", return_value=recorder),
+        patch.object(consumer_module, "current_span_id", return_value="outer-span"),
+    ):
+        consumer.process_telemetry(json.dumps(native_model))
+        consumer.on_pending(event)
+        consumer.on_complete(event)
+
+    assert event.span_id == _MODEL_SPAN_ID
+    assert recorder.events[-2:] == [event, event]
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        None,
+        {},
+        {"traceparent": "01-0123456789abcdef0123456789abcdef-0123456789abcdef-01"},
+        {"traceparent": "00-0123456789ABCDEF0123456789ABCDEF-0123456789abcdef-01"},
+    ],
+)
+def test_bridge_event_rejects_missing_or_malformed_traceparent(
+    headers: dict[str, object] | None,
+) -> None:
+    consumer = GeminiConsumer()
+
+    with pytest.raises(RuntimeError, match="traceparent"):
+        consumer.on_pending(_bridge_model_event(headers))
+
+
+def test_bridge_event_rejects_duplicate_native_model_identity() -> None:
+    consumer = GeminiConsumer()
+    headers = {"traceparent": _traceparent()}
+
+    consumer.on_pending(_bridge_model_event(headers))
+
+    with pytest.raises(RuntimeError, match="duplicate"):
+        consumer.on_pending(_bridge_model_event(headers))
+
+
+def test_bridge_event_rejects_traceparent_for_non_model_native_span() -> None:
+    recorder = _TranscriptRecorder()
+    consumer = GeminiConsumer()
+    event = _bridge_model_event({"traceparent": _traceparent()})
+    native_tool = _span(
+        _MODEL_SPAN_ID,
+        None,
+        name="schedule_tool_calls",
+        operation="schedule_tool_calls",
+        start=100,
+        end=101,
+        trace_id=_TRACE_ID,
+    )
+
+    with patch.object(consumer_module, "transcript", return_value=recorder):
+        consumer.on_pending(event)
+        with pytest.raises(RuntimeError, match="not a native Gemini LLM span"):
+            consumer.process_telemetry(json.dumps(native_tool))
+
+
+def test_final_drain_rejects_bridge_event_without_exact_native_model_span() -> None:
+    consumer = GeminiConsumer(
+        sandbox=_TelemetrySandbox(""),
+        telemetry_path="/home/agent/.gemini/inspect-swe.otel.json",
+    )
+    consumer.on_pending(_bridge_model_event({"traceparent": _traceparent()}))
+
+    with pytest.raises(RuntimeError, match="unresolved bridge ModelEvent"):
+        anyio.run(consumer.finalize)

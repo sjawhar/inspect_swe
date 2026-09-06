@@ -3,13 +3,15 @@
 Gemini CLI writes completed OpenTelemetry spans and logs to the configured
 ``telemetry.outfile``.  This consumer drains that file at explicit native-command
 boundaries.  It records only IDs and parent links the CLI exports; bridge model
-calls remain on their outer Inspect span because Gemini's bridge request has no
-native child identity.
+calls wait until their selected W3C traceparent identifies an exact native LLM
+span.
 """
 
 from __future__ import annotations
 
 import json
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TypeAlias
@@ -17,6 +19,7 @@ from typing import TypeAlias
 from inspect_ai.event import CompactionEvent, SpanBeginEvent, SpanEndEvent
 from inspect_ai.event._model import ModelEvent
 from inspect_ai.log import transcript
+from inspect_ai.model import BRIDGE_REQUEST_HEADERS
 from inspect_ai.model._model import ModelEventSink
 from inspect_ai.util import SandboxEnvironment
 from inspect_ai.util._span import current_span_id
@@ -57,6 +60,20 @@ class _NativeCompaction:
     tokens_after: int
 
 
+@dataclass
+class _PendingBridgeModelEvent:
+    """One bridge event awaiting its exact exported native LLM span."""
+
+    event: ModelEvent
+    completed: bool = False
+    emitted: bool = False
+
+
+_TRACEPARENT = re.compile(
+    r"\A00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}\Z"
+)
+
+
 class GeminiConsumer(ModelEventSink):
     """Record bridge calls plus native Gemini CLI OTEL spans.
 
@@ -73,7 +90,9 @@ class GeminiConsumer(ModelEventSink):
     ) -> None:
         self._sandbox = sandbox
         self._telemetry_path = telemetry_path
-        self._emitted_model_events: set[int] = set()
+        self._pending_model_events: dict[_NativeKey, _PendingBridgeModelEvent] = {}
+        self._model_event_keys: dict[int, _NativeKey] = {}
+        self._claimed_model_keys: set[_NativeKey] = set()
         self._emitted_spans: dict[_NativeKey, _NativeSpan] = {}
         self._pending_spans: dict[_NativeKey, _NativeSpan] = {}
         self._emitted_compactions: set[str] = set()
@@ -81,20 +100,35 @@ class GeminiConsumer(ModelEventSink):
 
     @property
     def outer_span_id(self) -> str | None:
-        """Resolve outer attribution at event emission time."""
+        """Resolve the outer parent for a root native Gemini span."""
         return current_span_id()
 
     def on_pending(self, event: ModelEvent) -> None:
-        """Emit the real bridge event without inferring a child identity."""
-        event.span_id = self.outer_span_id
-        self._emitted_model_events.add(id(event))
-        transcript()._event(event)
+        """Buffer a bridge event until its exact native LLM span is available."""
+        key = _bridge_model_key(event)
+        if key in self._claimed_model_keys:
+            raise RuntimeError(
+                f"duplicate Gemini bridge ModelEvent claims native LLM span {key!r}"
+            )
+        self._claimed_model_keys.add(key)
+        self._pending_model_events[key] = _PendingBridgeModelEvent(event=event)
+        self._model_event_keys[id(event)] = key
+        self._flush_pending_model_events()
 
     def on_complete(self, event: ModelEvent) -> None:
-        """Complete the bridge event originally emitted by ``on_pending``."""
-        if id(event) in self._emitted_model_events:
-            self._emitted_model_events.discard(id(event))
+        """Update a bridge event only after native-span emission."""
+        key = self._model_event_keys.get(id(event))
+        if key is None:
+            raise RuntimeError("Gemini bridge ModelEvent completed before it was pending")
+        pending = self._pending_model_events.get(key)
+        if pending is None or pending.event is not event:
+            raise RuntimeError("Gemini bridge ModelEvent completion lost its pending identity")
+        if pending.completed:
+            raise RuntimeError("Gemini bridge ModelEvent completed more than once")
+        pending.completed = True
+        if pending.emitted:
             transcript()._event_updated(event)
+            self._remove_pending_model_event(key, pending)
 
     async def refresh(self, command: str) -> None:
         """Drain completed native telemetry before a score or submit command."""
@@ -102,8 +136,9 @@ class GeminiConsumer(ModelEventSink):
         await self._drain_configured_telemetry()
 
     async def finalize(self) -> None:
-        """Drain the final file and reject any span with no exported parent."""
+        """Drain final telemetry and reject unresolved bridge or native identities."""
         await self._drain_configured_telemetry()
+        self._assert_no_pending_model_events()
         self._assert_no_pending_native_records()
 
     async def _drain_configured_telemetry(self) -> None:
@@ -208,16 +243,56 @@ class GeminiConsumer(ModelEventSink):
             key = _span_key(span)
             self._pending_spans.pop(key)
             self._emitted_spans[key] = span
+        self._flush_pending_model_events()
         for compaction in ready_compactions:
             self._pending_compactions.pop(compaction.record_key)
             self._emitted_compactions.add(compaction.record_key)
 
     def reset(self) -> None:
-        """Clear state only after every native record has a resolved parent."""
+        """Clear state only after every bridge and native record is resolved."""
+        self._assert_no_pending_model_events()
         self._assert_no_pending_native_records()
-        self._emitted_model_events.clear()
+        self._model_event_keys.clear()
+        self._claimed_model_keys.clear()
         self._emitted_spans.clear()
         self._emitted_compactions.clear()
+
+    def _flush_pending_model_events(self) -> None:
+        """Emit bridge events only after their exact native LLM span has emitted."""
+        for key, pending in list(self._pending_model_events.items()):
+            native = self._emitted_spans.get(key) or self._pending_spans.get(key)
+            if native is None:
+                continue
+            if native.type != "model":
+                raise RuntimeError(
+                    "Gemini bridge traceparent resolves to a span that is not a "
+                    f"native Gemini LLM span: {key!r}"
+                )
+            if key not in self._emitted_spans:
+                continue
+            pending.event.span_id = native.span_id
+            transcript()._event(pending.event)
+            pending.emitted = True
+            if pending.completed:
+                self._remove_pending_model_event(key, pending)
+
+    def _remove_pending_model_event(
+        self, key: _NativeKey, pending: _PendingBridgeModelEvent
+    ) -> None:
+        """Forget one emitted event while retaining its claimed native identity."""
+        self._pending_model_events.pop(key)
+        recorded_key = self._model_event_keys.pop(id(pending.event), None)
+        if recorded_key != key:
+            raise RuntimeError("Gemini bridge ModelEvent identity bookkeeping diverged")
+
+    def _assert_no_pending_model_events(self) -> None:
+        if not self._pending_model_events:
+            return
+        keys = ", ".join(repr(key) for key in self._pending_model_events)
+        raise RuntimeError(
+            "Gemini telemetry finished with unresolved bridge ModelEvent identities: "
+            + keys
+        )
 
     def _stage_spans(self, spans: list[_NativeSpan]) -> None:
         for span in spans:
@@ -279,6 +354,26 @@ class GeminiConsumer(ModelEventSink):
             "Gemini telemetry finished with unresolved native parent records: "
             + "; ".join(item for item in (spans, compactions) if item)
         )
+
+
+def _bridge_model_key(event: ModelEvent) -> _NativeKey:
+    """Require the exact W3C identity selected into bridge request metadata."""
+    metadata = event.metadata
+    if not isinstance(metadata, Mapping):
+        raise RuntimeError("Gemini bridge ModelEvent is missing traceparent metadata")
+    headers = metadata.get(BRIDGE_REQUEST_HEADERS)
+    if not isinstance(headers, Mapping):
+        raise RuntimeError("Gemini bridge ModelEvent is missing traceparent headers")
+    traceparent = headers.get("traceparent")
+    if not isinstance(traceparent, str):
+        raise RuntimeError("Gemini bridge ModelEvent is missing traceparent")
+    match = _TRACEPARENT.fullmatch(traceparent)
+    if match is None:
+        raise RuntimeError(
+            f"Gemini bridge ModelEvent has malformed traceparent {traceparent!r}"
+        )
+    return match.group(1), match.group(2)
+
 
 def _decode_concatenated_json(contents: str) -> list[_JsonObject]:
     """Decode the pretty JSON values appended by Gemini's FileSpanExporter."""
