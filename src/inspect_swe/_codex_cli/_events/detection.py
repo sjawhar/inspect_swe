@@ -17,10 +17,14 @@ from inspect_ai.model._chat_message import (
 )
 from inspect_ai.tool import ToolCall
 
-# Codex built-in multi-agent tool names (the `multi_agent_v1` namespace).
+# Codex built-in multi-agent tool names.
 SPAWN_AGENT = "spawn_agent"
 CLOSE_AGENT = "close_agent"
 WAIT_AGENT = "wait_agent"
+
+# Codex 0.153.1 `sandboxing/src/spawn.rs` wraps a completed child response in
+# an `agent_message` whose first native input_text starts with this header.
+FINAL_AGENT_MESSAGE_HEADER = "Message Type: FINAL_ANSWER\nTask name: "
 
 # Marker injected as a user message when Codex performs *local* compaction. Our
 # custom bridge provider always forces the local path (remote compaction is gated
@@ -38,52 +42,6 @@ class SpawnedAgent:
     agent_type: str
     message: str
     reasoning_effort: str | None
-    task_name: str | None = None
-    """Multi-Agent V2 task name (e.g. "write_fizzbuzz"); None under V1."""
-
-    @property
-    def name(self) -> str:
-        """Display name for the agent's span (V2 task_name, else V1 agent_type)."""
-        return self.task_name or self.agent_type
-
-
-def agent_message_recipients(input_messages: list[ChatMessage]) -> set[str]:
-    """Recipients of the agent_message items in a request's input.
-
-    Multi-Agent V2 delivers inter-agent messages as `agent_message` input items;
-    the bridge preserves each raw item (author/recipient) on ContentText.internal.
-    Every agent_message in a request is inbound to the requester, so the
-    recipient path (e.g. "/root/write_fizzbuzz") identifies the calling agent.
-    """
-    return {
-        recipient
-        for item in _agent_message_items(input_messages)
-        if isinstance(recipient := item.get("recipient"), str) and recipient
-    }
-
-
-def final_answer_authors(input_messages: list[ChatMessage]) -> set[str]:
-    """Authors of FINAL_ANSWER agent_message items in a request's input.
-
-    A FINAL_ANSWER is a sub-agent's terminal return under Multi-Agent V2 (the
-    `wait_agent` result no longer carries per-thread completion status), so its
-    author path marks that agent's thread as completed.
-    """
-    authors: set[str] = set()
-    for item in _agent_message_items(input_messages):
-        author = item.get("author")
-        if not (isinstance(author, str) and author):
-            continue
-        for part in item.get("content") or []:
-            if (
-                isinstance(part, dict)
-                and part.get("type") == "input_text"
-                and isinstance(text := part.get("text"), str)
-                and text.lstrip().startswith("Message Type: FINAL_ANSWER")
-            ):
-                authors.add(author)
-                break
-    return authors
 
 
 def find_spawned_agents(tool_calls: list[ToolCall] | None) -> list[SpawnedAgent]:
@@ -97,14 +55,12 @@ def find_spawned_agents(tool_calls: list[ToolCall] | None) -> list[SpawnedAgent]
         if not isinstance(message, str) or not message:
             continue
         reasoning = args.get("reasoning_effort")
-        task_name = args.get("task_name")
         result.append(
             SpawnedAgent(
                 call_id=tc.id,
                 agent_type=str(args.get("agent_type") or "agent"),
                 message=message,
                 reasoning_effort=str(reasoning) if reasoning else None,
-                task_name=str(task_name) if task_name else None,
             )
         )
     return result
@@ -124,43 +80,53 @@ def find_close_targets(tool_calls: list[ToolCall] | None) -> list[str]:
 
 @dataclass
 class SpawnResult:
-    """The `{agent_id, nickname}` returned by a `spawn_agent` tool result."""
+    """A native routing key returned by a `spawn_agent` tool result.
 
-    agent_id: str
+    Codex multi-agent v1 returns `agent_id`; v2 returns the slash-prefixed
+    `task_name`. Each is an exact native key used by subsequent lifecycle
+    traffic, never a reconstructed child identity.
+    """
+
+    native_key: str
     nickname: str | None
 
 
 def spawn_result(message: ChatMessageTool) -> SpawnResult | None:
-    """The `agent_id` (thread id) + `nickname` from a `spawn_agent` tool result.
-
-    The result is correlated to its spawn call by `message.tool_call_id`, so the
-    caller can bind thread_id → span without any ordering assumptions. The
-    `nickname` (Codex's friendly per-agent name) is surfaced for tool views.
-
-    Multi-Agent V2 results carry `{"task_name": "/root/<name>"}` instead of
-    `agent_id`/`nickname`; the absolute task path serves as the thread id.
-    """
+    """Read a native v1 `agent_id` or v2 `task_name` from a spawn result."""
     if message.function != SPAWN_AGENT:
         return None
     data = _loads(message.text)
-    if isinstance(data, dict):
-        agent_id = data.get("agent_id") or data.get("task_name")
-        if isinstance(agent_id, str) and agent_id:
+    if not isinstance(data, dict):
+        return None
+
+    for field in ("agent_id", "task_name"):
+        native_key = data.get(field)
+        if isinstance(native_key, str) and native_key:
             nickname = data.get("nickname")
             return SpawnResult(
-                agent_id=agent_id,
+                native_key=native_key,
                 nickname=nickname if isinstance(nickname, str) and nickname else None,
             )
     return None
 
 
-def completed_thread_ids(input_messages: list[ChatMessage]) -> set[str]:
-    """Thread ids reported `completed`, from wait/close results and notifications.
+def agent_message_recipients(input_messages: list[ChatMessage]) -> set[str]:
+    """V2 child routing keys carried by preserved native `agent_message` input.
 
-    Two carriers, both seen in a parent's `input`:
-      - `wait_agent`/`close_agent` tool results: `{"status": {"<tid>": {"completed": ...}}}`
-      - `<subagent_notification>` user messages: `{"agent_path": "<tid>", "status": {"completed": ...}}`
+    The bridge stores a raw Responses `agent_message` under
+    `ContentText.internal["agent_message"]`. Its `recipient` is the native
+    v2 task path selected by the parent's `spawn_agent` result.
     """
+    recipients: set[str] = set()
+    for agent_message in _native_agent_messages(input_messages):
+        recipient = agent_message.get("recipient")
+        if isinstance(recipient, str) and recipient:
+            recipients.add(recipient)
+    return recipients
+
+
+def completed_agent_keys(input_messages: list[ChatMessage]) -> set[str]:
+    """Native keys reported completed by tools, notifications, or final handoffs."""
     completed: set[str] = set()
     for msg in input_messages:
         if isinstance(msg, ChatMessageTool):
@@ -169,6 +135,13 @@ def completed_thread_ids(input_messages: list[ChatMessage]) -> set[str]:
         elif isinstance(msg, ChatMessageUser):
             if "<subagent_notification>" in msg.text:
                 _collect_notification_completed(msg.text, completed)
+
+    for agent_message in _native_agent_messages(input_messages):
+        if not _is_final_agent_message(agent_message):
+            continue
+        author = agent_message.get("author")
+        if isinstance(author, str) and author:
+            completed.add(author)
     return completed
 
 
@@ -186,21 +159,6 @@ def is_compaction_request(input_messages: list[ChatMessage]) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _agent_message_items(input_messages: list[ChatMessage]) -> list[dict[str, Any]]:
-    """Raw agent_message items stashed on user-message content by the bridge."""
-    items: list[dict[str, Any]] = []
-    for msg in input_messages:
-        if not isinstance(msg, ChatMessageUser) or isinstance(msg.content, str):
-            continue
-        for content in msg.content:
-            internal = getattr(content, "internal", None)
-            if isinstance(internal, dict):
-                item = internal.get("agent_message")
-                if isinstance(item, dict):
-                    items.append(item)
-    return items
-
-
 def _loads(text: str) -> Any:
     try:
         return json.loads(text)
@@ -208,23 +166,63 @@ def _loads(text: str) -> Any:
         return None
 
 
+def _native_agent_messages(input_messages: list[ChatMessage]) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    for message in input_messages:
+        if not isinstance(message, ChatMessageUser) or not isinstance(
+            message.content, list
+        ):
+            continue
+        for content in message.content:
+            internal = getattr(content, "internal", None)
+            agent_message = (
+                internal.get("agent_message") if isinstance(internal, dict) else None
+            )
+            if (
+                isinstance(agent_message, dict)
+                and agent_message.get("type") == "agent_message"
+            ):
+                messages.append(agent_message)
+    return messages
+
+
+def _is_final_agent_message(agent_message: dict[str, Any]) -> bool:
+    """Whether Codex's native spawn transport says this author finished."""
+    if not isinstance(agent_message.get("id"), str) or not agent_message["id"]:
+        return False
+    if not isinstance(agent_message.get("recipient"), str) or not agent_message[
+        "recipient"
+    ]:
+        return False
+    parts = agent_message.get("content")
+    if not isinstance(parts, list) or not parts:
+        return False
+    first_part = parts[0]
+    return (
+        isinstance(first_part, dict)
+        and first_part.get("type") == "input_text"
+        and isinstance(first_part.get("text"), str)
+        and first_part["text"].startswith(FINAL_AGENT_MESSAGE_HEADER)
+    )
+
+
 def _collect_status_completed(data: Any, out: set[str]) -> None:
-    # {"status": {"<thread_id>": {"completed": ...}, ...}}
+    # {"status": {"<native-key>": {"completed": ...}, ...}}
     if not isinstance(data, dict):
         return
     status = data.get("status")
     if isinstance(status, dict):
-        for thread_id, value in status.items():
+        for native_key, value in status.items():
             if (
-                isinstance(thread_id, str)
+                isinstance(native_key, str)
                 and isinstance(value, dict)
                 and "completed" in value
             ):
-                out.add(thread_id)
+                out.add(native_key)
 
 
 def _collect_notification_completed(text: str, out: set[str]) -> None:
-    # <subagent_notification>{"agent_path": "<tid>", "status": {"completed": ...}}</...>
+    # <subagent_notification>{"agent_path": "<native-key>", "status": {"completed": ...}}</...>
     payload = (
         text.replace("<subagent_notification>", "")
         .replace("</subagent_notification>", "")
@@ -233,11 +231,11 @@ def _collect_notification_completed(text: str, out: set[str]) -> None:
     data = _loads(payload)
     if not isinstance(data, dict):
         return
-    thread_id = data.get("agent_path")
+    native_key = data.get("agent_path")
     status = data.get("status")
     if (
-        isinstance(thread_id, str)
+        isinstance(native_key, str)
         and isinstance(status, dict)
         and "completed" in status
     ):
-        out.add(thread_id)
+        out.add(native_key)

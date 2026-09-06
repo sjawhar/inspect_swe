@@ -1,6 +1,7 @@
 from collections.abc import Iterator
 
 import pytest
+from inspect_ai._util.content import ContentText
 from inspect_ai.event import CompactionEvent, SpanBeginEvent, SpanEndEvent
 from inspect_ai.event._model import ModelEvent
 from inspect_ai.log import Transcript
@@ -8,6 +9,7 @@ from inspect_ai.log._transcript import init_transcript, transcript
 from inspect_ai.model import (
     ChatMessage,
     ChatMessageAssistant,
+    ChatMessageTool,
     ChatMessageUser,
     GenerateConfig,
     ModelOutput,
@@ -220,6 +222,17 @@ def _codex_spawn(call_id: str, message: str) -> ToolCall:
     )
 
 
+def _codex_v2_spawn(call_id: str, task_name: str) -> ToolCall:
+    return ToolCall(
+        id=call_id,
+        function="spawn_agent",
+        arguments={
+            "task_name": task_name.removeprefix("/root/"),
+            "message": "Create the child proof file.",
+        },
+    )
+
+
 @pytest.mark.anyio
 async def test_codex_does_not_merge_overlapping_child_prompts_into_parent() -> None:
     consumer = CodexConsumer()
@@ -245,6 +258,143 @@ async def test_codex_does_not_merge_overlapping_child_prompts_into_parent() -> N
         consumer.on_pending(child)
         assert child.span_id is None
         consumer.reset()
+
+
+@pytest.mark.anyio
+async def test_codex_binds_same_model_v2_siblings_from_native_agent_message_recipients() -> (
+    None
+):
+    consumer = CodexConsumer()
+    first_path = "/root/write_child_proof"
+    second_path = "/root/write_second_proof"
+    parent = _model_event(
+        [],
+        ModelOutput.from_message(
+            ChatMessageAssistant(
+                content="",
+                tool_calls=[
+                    _codex_v2_spawn("spawn-1", first_path),
+                    _codex_v2_spawn("spawn-2", second_path),
+                ],
+            )
+        ),
+    )
+    binding = _model_event(
+        [
+            ChatMessageTool(
+                content='{"task_name": "/root/write_second_proof"}',
+                tool_call_id="spawn-2",
+                function="spawn_agent",
+            ),
+            ChatMessageTool(
+                content='{"task_name": "/root/write_child_proof"}',
+                tool_call_id="spawn-1",
+                function="spawn_agent",
+            ),
+        ]
+    )
+
+    def child_event(task_path: str, agent_message_id: str) -> ModelEvent:
+        handoff = {
+            "type": "agent_message",
+            "id": agent_message_id,
+            "author": "/root",
+            "recipient": task_path,
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": (
+                        "Message Type: NEW_TASK\n"
+                        f"Task name: {task_path}\n"
+                        "Sender: /root\n"
+                        "Payload:\n"
+                    ),
+                },
+                {
+                    "type": "encrypted_content",
+                    "encrypted_content": "Create the child proof file.",
+                },
+            ],
+        }
+        return _model_event(
+            [
+                ChatMessageUser(
+                    content=[
+                        ContentText(
+                            text="Agent message from /root:\nCreate the child proof file.",
+                            internal={"agent_message": handoff},
+                        )
+                    ]
+                )
+            ]
+        )
+
+    first_child = child_event(
+        first_path, "amsg_01a07523-ade2-7363-949c-08a1e028863a"
+    )
+    second_child = child_event(
+        second_path, "amsg_01a07523-ade2-7363-949c-08a1e028863b"
+    )
+    completion = _model_event(
+        [
+            ChatMessageUser(
+                content=[
+                    ContentText(
+                        text=(
+                            "Agent message from /root/write_child_proof:\n"
+                            "The child proof file is complete."
+                        ),
+                        internal={
+                            "agent_message": {
+                                "type": "agent_message",
+                                "id": "amsg_01a0752c-b962-7db3-8566-816a80a74092",
+                                "author": first_path,
+                                "recipient": "/root",
+                                "content": [
+                                    {
+                                        "type": "input_text",
+                                        "text": (
+                                            "Message Type: FINAL_ANSWER\n"
+                                            "Task name: /root\n"
+                                            "Sender: /root/write_child_proof\n"
+                                            "Payload:\n"
+                                            "The child proof file is complete."
+                                        ),
+                                    }
+                                ],
+                            }
+                        },
+                    )
+                ]
+            )
+        ]
+    )
+
+
+    async with span("human_cli", type="agent", id="human-cli"):
+        consumer.on_pending(parent)
+        consumer.on_complete(parent)
+        consumer.on_pending(binding)
+        # The native child requests may arrive in either order.
+        consumer.on_pending(second_child)
+        consumer.on_pending(first_child)
+        consumer.on_pending(completion)
+
+    # All three calls use mock/model. Only the exact task_name/recipient join,
+    # not model or prompt similarity, selects the sibling spans.
+    assert parent.model == first_child.model == second_child.model == "mock/model"
+    assert first_child.span_id == "agent-spawn-1"
+    assert second_child.span_id == "agent-spawn-2"
+    assert [
+        event_id for event_id in _span_events(SpanBeginEvent) if event_id.startswith("agent-")
+    ] == ["agent-spawn-1", "agent-spawn-2"]
+    assert [
+        event_id for event_id in _span_events(SpanEndEvent) if event_id.startswith("agent-")
+    ] == ["agent-spawn-1"]
+    consumer.reset()
+    assert [
+        event_id for event_id in _span_events(SpanEndEvent) if event_id.startswith("agent-")
+    ] == ["agent-spawn-1", "agent-spawn-2"]
 
 
 def test_codex_reset_closes_unbound_child_once() -> None:
