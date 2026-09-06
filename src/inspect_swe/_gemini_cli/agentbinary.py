@@ -29,11 +29,36 @@ async def ensure_gemini_cli_setup(
     """
     platform = await detect_sandbox_platform(sandbox)
     node_binary = await ensure_node_available(sandbox, platform, user)
+    if version == "sandbox":
+        return await _sandbox_gemini_binary(sandbox, node_binary, user), node_binary
     gemini_version = await resolve_gemini_version(version)
     gemini_binary = await ensure_gemini_cli_installed(
         sandbox, node_binary, gemini_version, platform, user
     )
     return gemini_binary, node_binary
+
+
+async def _sandbox_gemini_binary(
+    sandbox: SandboxEnvironment, node_path: str, user: str | None
+) -> str:
+    """Return the pre-attached Gemini executable without release resolution."""
+    result = await sandbox.exec(bash_command("which gemini"), user=user)
+    if not result.success or not result.stdout.strip():
+        raise RuntimeError(
+            "Gemini CLI version='sandbox' requires an attached gemini executable"
+        )
+    gemini_binary = result.stdout.strip()
+    version_result = await sandbox.exec(
+        cmd=[node_path, gemini_binary, "--version"],
+        user=user,
+    )
+    if not version_result.success:
+        raise RuntimeError(
+            "attached Gemini CLI executable failed its version check:\n"
+            f"stdout: {version_result.stdout}\n"
+            f"stderr: {version_result.stderr}"
+        )
+    return gemini_binary
 
 
 async def resolve_gemini_version(

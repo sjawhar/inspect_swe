@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+* Native Centaur sessions now expose an operator-ready bridge lifecycle and preserve native CLI conversation state while accepting CLI-selected model routing.
+
 ## [0.2.70](https://github.com/meridianlabs-ai/inspect_swe/compare/0.2.69...0.2.70) (2026-08-09)
 
 

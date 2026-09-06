@@ -13,7 +13,13 @@ from inspect_ai.agent import (
     agent_with,
     sandbox_agent_bridge,
 )
-from inspect_ai.model import ChatMessageSystem, GenerateFilter, Model, StopReason
+from inspect_ai.model import (
+    ChatMessageSystem,
+    GenerateFilter,
+    Model,
+    ModelResolver,
+    StopReason,
+)
 from inspect_ai.scorer import score
 from inspect_ai.tool import (
     MCPServerConfig,
@@ -44,7 +50,12 @@ from inspect_swe._claude_code._events.stream import (
     StderrEvent,
     claude_code_event_stream,
 )
-from inspect_swe._util.centaur import CentaurOptions, CommandsFilter, run_centaur
+from inspect_swe._util.centaur import (
+    CentaurOptions,
+    CentaurSession,
+    CommandsFilter,
+    run_centaur,
+)
 from inspect_swe._util.mcp_ready import (
     DEFAULT_MCP_READY_TIMEOUT,
     wait_for_mcp_endpoints,
@@ -137,6 +148,8 @@ def claude_code(
     subagent_model: str | None = None,
     filter: GenerateFilter | None = None,
     commands_filter: CommandsFilter | None = None,
+    model_resolver: ModelResolver | None = None,
+    accumulate_conversations: bool = False,
     permission_mode: ClaudeCodePermissionMode | None = None,
     retry_refusals: int | None = 3,
     retry_uncaught_errors: int | None = 3,
@@ -314,26 +327,32 @@ def claude_code(
         # full mechanism.
         consumer = LiveConsumer()
 
-        # Resolve the (cosmetic) model identities Claude Code presents to itself
-        # and the bridge aliases that route them to the real served model. The
-        # per-role env vars below carry the opus/sonnet/haiku/subagent names.
-        models = resolve_claude_code_models(
-            model,
-            model_config,
-            effort=effort,
-            opus_model=opus_model,
-            sonnet_model=sonnet_model,
-            haiku_model=haiku_model,
-            subagent_model=subagent_model,
-            model_aliases=model_aliases,
+        # A resolver without an explicit model is the native interactive path:
+        # the CLI asks for the user's selected model and the bridge resolves it
+        # at request time. Avoid static presentation defaults that would pin
+        # the CLI to a factory-selected model.
+        dynamic_model = model_resolver is not None and model is None
+        models = (
+            None
+            if dynamic_model
+            else resolve_claude_code_models(
+                model,
+                model_config,
+                effort=effort,
+                opus_model=opus_model,
+                sonnet_model=sonnet_model,
+                haiku_model=haiku_model,
+                subagent_model=subagent_model,
+                model_aliases=model_aliases,
+            )
         )
 
         async with (
             checkpointer() as cp,
             sandbox_agent_bridge(
                 state,
-                model=models.bridge_model,
-                model_aliases=models.aliases,
+                model=models.bridge_model if models is not None else None,
+                model_aliases=models.aliases if models is not None else model_aliases,
                 forward_generation_config=transparent_proxy,
                 filter=filter,
                 sandbox=sandbox,
@@ -345,6 +364,8 @@ def claude_code(
                 ),
                 model_event_sink=consumer,
                 checkpointer=cp,
+                model_resolver=model_resolver,
+                accumulate_conversations=accumulate_conversations,
             ) as bridge,
         ):
             if cp.attempt == "resume_for_scoring":
@@ -367,7 +388,9 @@ def claude_code(
                 if effective_permission_mode is not None
                 else ["--dangerously-skip-permissions"]
             )
-            cmd = [*permission_flag, "--model", models.presented]
+            cmd = [*permission_flag]
+            if models is not None:
+                cmd.extend(["--model", models.presented])
 
             # add interactive options if not running as centaur
             if centaur is False:
@@ -449,16 +472,30 @@ def claude_code(
                     required=True,
                 )
 
-            # centaur mode uses human_cli with custom instructions and bash rc
+            # Centaur begins only after the bridge, binary, command, environment,
+            # and working directory are all ready for the operator.
             if centaur:
-                await run_claude_code_centaur(
-                    options=centaur,
-                    claude_cmd=[claude_binary] + cmd,
-                    agent_env=agent_env,
-                    state=state,
-                    user=user,
-                    commands_filter=commands_filter,
-                )
+                invocation = [claude_binary, "--session-id", session_id, *cmd]
+                try:
+                    return await run_claude_code_centaur(
+                        options=centaur,
+                        claude_cmd=invocation,
+                        agent_env=agent_env,
+                        session=CentaurSession(
+                            state=bridge.state,
+                            invocation=tuple(invocation),
+                            environment=agent_env,
+                            cwd=agent_cwd,
+                            user=user,
+                            sandbox=sbox,
+                            bridge_port=bridge.port,
+                            session_id=session_id,
+                        ),
+                        consumer=consumer,
+                        commands_filter=commands_filter,
+                    )
+                finally:
+                    consumer.reset()
             else:
                 # execute the agent (track debug output)
                 debug_output: list[str] = []
@@ -754,13 +791,17 @@ async def run_claude_code_centaur(
     options: CentaurOptions,
     claude_cmd: list[str],
     agent_env: dict[str, str],
-    state: AgentState,
-    user: str | None = None,
+    session: CentaurSession,
+    consumer: LiveConsumer,
     commands_filter: CommandsFilter | None = None,
-) -> None:
-    instructions = "Claude Code:\n\n - You may also use Claude Code via the 'claude' command.\n - Use 'claude --resume' if you need to resume a previous claude session."
+) -> AgentState:
+    """Run one interactive Claude session against its wrapper-owned transcript."""
+    instructions = "Claude Code:\n\n - You may also use Claude Code via the 'claude' command."
+    if session.session_id is None:
+        raise RuntimeError("Claude Centaur requires a wrapper-owned session ID.")
+    consumer.configure_centaur_session(session.sandbox, session.user, session.session_id)
+    session.refresh = consumer.refresh
 
-    # build .bashrc content
     agent_env_vars = [f'export {k}="{v}"' for k, v in agent_env.items()]
     claude_config = """echo '{"hasCompletedOnboarding":true,"bypassPermissionsModeAccepted":true}' > "$HOME"/.claude.json"""
     path_config = [
@@ -768,15 +809,44 @@ async def run_claude_code_centaur(
         'export PATH="$HOME/.local/bin:$PATH"',
         f'ln -sf {claude_cmd[0]} "$HOME/.local/bin/claude"',
     ]
-    alias_cmd = shlex.join(claude_cmd)
-    alias_cmd = "alias claude='" + alias_cmd.replace("'", "'\\''") + "'"
+    if claude_cmd[1:3] != ["--session-id", session.session_id]:
+        raise RuntimeError("Claude Centaur command lost its wrapper-owned session ID.")
+    wrapped_command = shlex.join(claude_cmd)
+    resume_command = shlex.join(
+        [claude_cmd[0], "--resume", session.session_id, *claude_cmd[3:]]
+    )
+    session_id = shlex.quote(session.session_id)
+    alias_cmd = dedent(f"""\
+        claude() {{
+          case "$1" in
+            --resume|-r)
+              if [ "$2" = {session_id} ]; then
+                shift 2
+              elif [ -z "$2" ] || [ "${{2#-}}" != "$2" ]; then
+                shift
+              else
+                printf '%s\\n' 'Centaur Claude sessions may only resume the wrapper-owned session.' >&2
+                return 2
+              fi
+              command {resume_command} "$@"
+              ;;
+            --continue|-c)
+              shift
+              command {resume_command} "$@"
+              ;;
+            *)
+              command {wrapped_command} "$@"
+              ;;
+          esac
+        }}
+    """).strip()
+    login_cwd = f"cd -- {shlex.quote(session.cwd)}"
     bashrc = "\n".join(
-        agent_env_vars + path_config + ["", claude_config, "", alias_cmd]
+        agent_env_vars + path_config + ["", claude_config, "", alias_cmd, login_cwd]
     )
 
-    # run the human cli
-    await run_centaur(
-        options, instructions, bashrc, state, user=user, commands_filter=commands_filter
+    return await run_centaur(
+        options, instructions, bashrc, session, commands_filter=commands_filter
     )
 
 

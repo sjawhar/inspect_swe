@@ -17,6 +17,7 @@ from inspect_ai.model import (
     GenerateFilter,
     Model,
     ModelName,
+    ModelResolver,
     get_model,
 )
 from inspect_ai.scorer import score
@@ -26,7 +27,7 @@ from inspect_ai.util._sandbox import ExecRemoteAwaitableOptions
 
 from .._util._async import is_callable_coroutine
 from .._util.agentwheel import AgentWheelSource, ensure_agent_wheel_installed
-from .._util.centaur import CentaurOptions, run_centaur
+from .._util.centaur import CentaurOptions, CentaurSession, run_centaur
 from .._util.messages import build_user_prompt
 from .._util.sandbox import resolve_agent_cwd
 from .._util.trace import trace
@@ -65,8 +66,10 @@ def mini_swe_agent(
     env: dict[str, str] | None = None,
     user: str | None = None,
     sandbox: str | None = None,
-    version: Literal["stable", "sandbox", "latest"] | str = "stable",
     debug: bool | None = None,
+    *,
+    model_resolver: ModelResolver | None = None,
+    accumulate_conversations: bool = False,
 ) -> Agent:
     """mini-swe-agent agent.
 
@@ -140,6 +143,8 @@ def mini_swe_agent(
             retry_refusals=retry_refusals,
             compaction=compaction,
             port=port,
+            model_resolver=model_resolver,
+            accumulate_conversations=accumulate_conversations,
         ) as bridge:
             # resolve sandbox
             sbox = sandbox_env(sandbox)
@@ -170,11 +175,20 @@ def mini_swe_agent(
 
             # centaur mode uses human_cli with custom instructions and bashrc
             if centaur:
-                await _run_mini_swe_centaur(
+                return await _run_mini_swe_centaur(
                     options=centaur,
                     mini_cmd=[mini_binary],
                     agent_env=agent_env,
-                    state=state,
+                    session=CentaurSession(
+                        state=bridge.state,
+                        invocation=(mini_binary,),
+                        environment=agent_env,
+                        cwd=agent_cwd,
+                        user=user,
+                        sandbox=sbox,
+                        bridge_port=bridge.port,
+                        session_id=None,
+                    ),
                 )
             else:
                 # install resumable agent to sandbox
@@ -286,8 +300,8 @@ async def _run_mini_swe_centaur(
     options: CentaurOptions,
     mini_cmd: list[str],
     agent_env: dict[str, str],
-    state: AgentState,
-) -> None:
+    session: CentaurSession,
+) -> AgentState:
     instructions = (
         "mini-swe-agent:\n\n - You may use mini-swe-agent via the 'mini' command."
     )
@@ -296,10 +310,11 @@ async def _run_mini_swe_centaur(
     agent_env_vars = [f"export {k}={shlex.quote(v)}" for k, v in agent_env.items()]
     alias_cmd = shlex.join(mini_cmd)
     alias_cmd = "alias mini='" + alias_cmd.replace("'", "'\\''") + "'"
-    bashrc = "\n".join(agent_env_vars + ["", alias_cmd])
+    bashrc = "\n".join(
+        agent_env_vars + ["", alias_cmd, f"cd -- {shlex.quote(session.cwd)}"]
+    )
 
-    # run the human cli
-    await run_centaur(options, instructions, bashrc, state)
+    return await run_centaur(options, instructions, bashrc, session)
 
 
 def _model_without_responses_api(model: str | Model | None) -> Model:

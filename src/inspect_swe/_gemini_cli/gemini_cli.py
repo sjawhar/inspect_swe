@@ -13,7 +13,7 @@ from inspect_ai.agent import (
     agent_with,
     sandbox_agent_bridge,
 )
-from inspect_ai.model import ChatMessageSystem, GenerateFilter, Model
+from inspect_ai.model import ChatMessageSystem, GenerateFilter, Model, ModelResolver
 from inspect_ai.scorer import score
 from inspect_ai.tool import MCPServerConfig, Skill, install_skills, read_skills
 from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
@@ -22,7 +22,12 @@ from inspect_ai.util import store
 from inspect_ai.util._sandbox import ExecRemoteAwaitableOptions
 
 from inspect_swe._util._async import is_callable_coroutine
-from inspect_swe._util.centaur import CentaurOptions, CommandsFilter, run_centaur
+from inspect_swe._util.centaur import (
+    CentaurOptions,
+    CentaurSession,
+    CommandsFilter,
+    run_centaur,
+)
 from inspect_swe._util.mcp_ready import (
     DEFAULT_MCP_READY_TIMEOUT,
     wait_for_mcp_endpoints,
@@ -33,6 +38,7 @@ from inspect_swe._util.sandbox import resolve_agent_cwd
 from inspect_swe._util.trace import trace
 
 from .agentbinary import ensure_gemini_cli_setup
+from ._events import GeminiConsumer
 
 
 @agent
@@ -63,6 +69,8 @@ def gemini_cli(
     debug: bool | None = None,
     *,
     commands_filter: CommandsFilter | None = None,
+    model_resolver: ModelResolver | None = None,
+    accumulate_conversations: bool = False,
 ) -> Agent:
     """Gemini CLI agent.
 
@@ -125,6 +133,16 @@ def gemini_cli(
         port = store().get(MODEL_PORT, 3000) + 1
         store().set(MODEL_PORT, port)
 
+        sbox = sandbox_env(sandbox)
+        agent_cwd = await resolve_agent_cwd(sbox, user, cwd)
+        home_result = await sbox.exec(["sh", "-c", "echo $HOME"], user=user)
+        sandbox_home = home_result.stdout.strip() or "/root"
+        telemetry_path = f"{sandbox_home}/.gemini/inspect-swe.otel.json"
+        consumer = GeminiConsumer(
+            sandbox=sbox,
+            telemetry_path=telemetry_path,
+        )
+
         async with sandbox_agent_bridge(
             state,
             model=model,
@@ -135,12 +153,13 @@ def gemini_cli(
             port=port,
             bridged_tools=bridged_tools,
             web_search=web_search,
+            model_resolver=model_resolver,
+            accumulate_conversations=accumulate_conversations,
+            model_event_metadata_headers=("traceparent", "tracestate"),
+            model_event_sink=consumer,
         ) as bridge:
-            # resolve sandbox
-            sbox = sandbox_env(sandbox)
-
-            # resolve working directory (home dir if sandbox default is '/')
-            agent_cwd = await resolve_agent_cwd(sbox, user, cwd)
+            # The native telemetry output location is determined before bridge
+            # construction so the bridge event sink and CLI settings share it.
 
             # install skills
             if resolved_skills is not None:
@@ -155,14 +174,13 @@ def gemini_cli(
             # mcp servers
             all_mcp_servers = list(mcp_servers or []) + list(bridge.mcp_server_configs)
 
-            # detect sandbox home directory
-            home_result = await sbox.exec(["sh", "-c", "echo $HOME"], user=user)
-            sandbox_home = home_result.stdout.strip() or "/root"
-
             # write settings.json: disable Clearcut usage-statistics telemetry
             # (on by default; only disable is via this settings key — env
             # vars / DO_NOT_TRACK are not honoured) and register MCP servers
-            settings_json = build_gemini_settings(all_mcp_servers)
+            settings_json = build_gemini_settings(
+                all_mcp_servers,
+                telemetry_outfile=telemetry_path,
+            )
             gemini_settings_dir = f"{sandbox_home}/.gemini"
             await sbox.exec(["mkdir", "-p", gemini_settings_dir], user=user)
             await sbox.write_file(f"{gemini_settings_dir}/settings.json", settings_json)
@@ -236,16 +254,27 @@ def gemini_cli(
                 )
 
             if centaur:
-                await _run_gemini_cli_centaur(
-                    options=centaur,
-                    gemini_cmd=cmd,
-                    agent_env=agent_env,
-                    state=state,
-                    user=user,
-                    commands_filter=commands_filter,
-                )
-            else:
-                # execute the agent (track debug output)
+                try:
+                    return await _run_gemini_cli_centaur(
+                        options=centaur,
+                        gemini_cmd=cmd,
+                        agent_env=agent_env,
+                        session=CentaurSession(
+                            state=bridge.state,
+                            invocation=tuple(cmd),
+                            environment=agent_env,
+                            cwd=agent_cwd,
+                            user=user,
+                            sandbox=sbox,
+                            bridge_port=bridge.port,
+                            session_id=None,
+                            refresh=consumer.refresh,
+                            finalize=consumer.finalize,
+                        ),
+                        commands_filter=commands_filter,
+                    )
+                finally:
+                    consumer.reset()
                 debug_output: list[str] = []
                 agent_prompt = prompt
                 attempt_count = 0
@@ -284,6 +313,7 @@ def gemini_cli(
                         stream=False,
                     )
 
+                    await consumer.refresh("gemini execution")
                     # track debug output
                     if debug:
                         debug_output.append(result.stdout)
@@ -326,12 +356,15 @@ def gemini_cli(
                     debug_output.insert(0, "Gemini CLI Debug Output:")
                     trace("\n".join(debug_output))
 
+        consumer.reset()
         return bridge.state
 
     return agent_with(execute, name=name, description=description)
 
-
-def build_gemini_settings(mcp_servers: Sequence[MCPServerConfig]) -> str:
+def build_gemini_settings(
+    mcp_servers: Sequence[MCPServerConfig],
+    telemetry_outfile: str | None = None,
+) -> str:
     """Build Gemini CLI settings.json content (privacy + MCP server configs)."""
     settings: dict[str, Any] = {
         "privacy": {"usageStatisticsEnabled": False},
@@ -346,6 +379,12 @@ def build_gemini_settings(mcp_servers: Sequence[MCPServerConfig]) -> str:
         # GOOGLE_GEMINI_BASE_URL for the base URL, keeping traffic on the bridge.
         "security": {"auth": {"selectedType": "gemini-api-key"}},
     }
+    if telemetry_outfile is not None:
+        settings["telemetry"] = {
+            "enabled": True,
+            "traces": True,
+            "outfile": telemetry_outfile,
+        }
     if mcp_servers:
         mcp_servers_config: dict[str, Any] = {}
         for server in mcp_servers:
@@ -388,10 +427,9 @@ async def _run_gemini_cli_centaur(
     options: CentaurOptions,
     gemini_cmd: list[str],
     agent_env: dict[str, str],
-    state: AgentState,
-    user: str | None = None,
+    session: CentaurSession,
     commands_filter: CommandsFilter | None = None,
-) -> None:
+) -> AgentState:
     instructions = "Gemini CLI:\n\n - You may also use Gemini CLI via the 'gemini' command.\n - Use 'gemini --resume latest' if you need to resume a previous gemini session."
 
     # build .bashrc content - only export vars needed for the gemini alias,
@@ -400,9 +438,10 @@ async def _run_gemini_cli_centaur(
     agent_env_vars = [f'export {k}="{v}"' for k, v in centaur_env.items()]
     alias_cmd = shlex.join(gemini_cmd)
     alias_cmd = "alias gemini='" + alias_cmd.replace("'", "'\\''") + "'"
-    bashrc = "\n".join(agent_env_vars + ["", alias_cmd])
+    bashrc = "\n".join(
+        agent_env_vars + ["", alias_cmd, f"cd -- {shlex.quote(session.cwd)}"]
+    )
 
-    # run the human cli
-    await run_centaur(
-        options, instructions, bashrc, state, user=user, commands_filter=commands_filter
+    return await run_centaur(
+        options, instructions, bashrc, session, commands_filter=commands_filter
     )

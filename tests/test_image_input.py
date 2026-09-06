@@ -1,15 +1,16 @@
 import subprocess
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import anyio
 import pytest
 from inspect_ai import eval
-from inspect_ai.agent import AgentState
 from inspect_ai.log import EvalSample, resolve_sample_attachments
 from inspect_ai.model import ChatMessageAssistant, ChatMessageUser
+from inspect_ai.util import SandboxEnvironment
 from inspect_swe._codex_cli import codex_cli as codex_cli_module
-from inspect_swe._util.centaur import CentaurOptions
+from inspect_swe._util.centaur import CentaurOptions, CentaurSession
 
 from tests.conftest import (
     get_available_sandboxes,
@@ -21,6 +22,19 @@ from tests.conftest import (
 # examples/image_input (magenta = rgb(255,0,255), green = rgb(0,200,0))
 MAGENTA_NAMES = ["magenta", "fuchsia", "pink", "purple", "violet"]
 GREEN_NAMES = ["green"]
+
+
+def _centaur_session(state: AgentState) -> CentaurSession:
+    return CentaurSession(
+        state=state,
+        invocation=("/usr/bin/codex",),
+        environment={},
+        cwd="/workdir",
+        user=None,
+        sandbox=MagicMock(spec=SandboxEnvironment),
+        bridge_port=0,
+        session_id=None,
+    )
 
 
 @skip_if_no_openai
@@ -75,10 +89,15 @@ def test_codex_cli_centaur_attaches_images_once(
     captured: dict[str, str] = {}
 
     async def fake_run_centaur(
-        options: CentaurOptions, instructions: str, bashrc: str, state: AgentState
-    ) -> None:
+        options: CentaurOptions,
+        instructions: str,
+        bashrc: str,
+        session: CentaurSession,
+        commands_filter: object | None = None,
+    ) -> AgentState:
         captured["instructions"] = instructions
         captured["bashrc"] = bashrc
+        return session.state
 
     monkeypatch.setattr(codex_cli_module, "run_centaur", fake_run_centaur)
 
@@ -89,7 +108,7 @@ def test_codex_cli_centaur_attaches_images_once(
             codex_cmd=["/usr/bin/codex", "--model", "gpt-5", "-c", "key=value"],
             image_files=[image_file],
             agent_env={},
-            state=AgentState(messages=[]),
+            session=_centaur_session(AgentState(messages=[])),
         )
     )
 
@@ -126,10 +145,15 @@ def test_codex_cli_centaur_alias_without_images(
     captured: dict[str, str] = {}
 
     async def fake_run_centaur(
-        options: CentaurOptions, instructions: str, bashrc: str, state: AgentState
-    ) -> None:
+        options: CentaurOptions,
+        instructions: str,
+        bashrc: str,
+        session: CentaurSession,
+        commands_filter: object | None = None,
+    ) -> AgentState:
         captured["instructions"] = instructions
         captured["bashrc"] = bashrc
+        return session.state
 
     monkeypatch.setattr(codex_cli_module, "run_centaur", fake_run_centaur)
 
@@ -139,7 +163,7 @@ def test_codex_cli_centaur_alias_without_images(
             codex_cmd=["/usr/bin/codex", "--model", "gpt-5"],
             image_files=[],
             agent_env={},
-            state=AgentState(messages=[]),
+            session=_centaur_session(AgentState(messages=[])),
         )
     )
 

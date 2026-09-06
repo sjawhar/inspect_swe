@@ -1,333 +1,303 @@
-"""Real-time consumer of Claude Code JSONL output.
+"""Bridge and native-transcript recorder for Claude Code.
 
-Two responsibilities, both driven from the same `LiveConsumer` instance:
-
-1. **`ModelEventSink`** — installed on the agent bridge so the bridge hands
-   us every `ModelEvent` for routing instead of emitting it to the transcript
-   itself. We attribute each event to the correct agent span at `on_pending`
-   time, then forward to the transcript with the attributed span_id.
-
-   **Attribution mechanism (substring match against pending sub-agents)**:
-
-   Claude Code 2.1.x makes sub-agents opaque in JSONL — sub-agent model
-   calls have no `parent_tool_use_id`, no separate `session_id`, and no
-   `isSidechain` marker. So we cannot use JSONL alone to drive span
-   open/close for sub-agents.
-
-   When a bridge call's output contains Task/Agent tool_calls (i.e. the
-   parent agent is spawning sub-agents), `on_complete` does two things,
-   synchronously, *before* the bridge response is sent back to Claude
-   Code:
-
-     1. Open an agent `SpanBeginEvent` for each Task/Agent tool_use, with
-        `parent_id` = the parent call's span_id and span_id =
-        `agent-{tool_use_id}`.
-     2. Register the sub-agent in `_pending_subagents` (mapping
-        `tool_use_id → prompt`).
-
-   When sub-agent's first bridge call arrives, `_attribute` scans its
-   first user message text for any pending sub-agent prompt as a
-   substring. A single hit identifies the sub-agent and we look up its
-   already-open span. Zero hits → main-agent call (outer span). Multiple
-   hits (rare; concurrent sub-agents with substring-overlapping prompts)
-   → outer span as defensive default.
-
-   Doing both open + register in `on_complete` (rather than from JSONL)
-   eliminates a race: the sub-agent's bridge call arrives at the bridge
-   server ~1–2 seconds before our stdout reader processes the parent's
-   `assistant` JSONL line, so a JSONL-driven span open would miss every
-   first call.
-
-   This works for every sub-agent call (not just the first) because
-   Claude Code re-sends the sub-agent's full conversation history on
-   each request, with the original Task prompt always at `input[0]`.
-   `_pending_subagents` and the open span are cleared in `_handle_user`
-   when the matching `tool_result` arrives.
-
-2. **JSONL consumer** — `process_jsonl_line` reads each line printed by
-   Claude Code's `--output-format stream-json` and emits agent
-   `SpanEndEvent` (on `tool_result` for Task/Agent), and emits
-   `CompactionEvent` for `compact_boundary` system events. Span
-   *opening* is no longer driven from JSONL — see callback (1) above.
+Child model events are associated only through the native session JSONL IDs
+emitted by Claude. The recorder never infers an agent relationship from prompt
+text, model name, timing, or generic conversation structure.
 """
 
+import json
+import shlex
 from dataclasses import dataclass
-from logging import getLogger
 from typing import Any
 
 from inspect_ai.event import CompactionEvent, SpanBeginEvent, SpanEndEvent
 from inspect_ai.event._model import ModelEvent
 from inspect_ai.log import transcript
-from inspect_ai.model._chat_message import (
-    ChatMessage,
-    ChatMessageSystem,
-    ChatMessageUser,
-)
+from inspect_ai.model._chat_message import ChatMessage, ChatMessageTool
 from inspect_ai.model._model import ModelEventSink
 from inspect_ai.model._model_output import StopReason
+from inspect_ai.util import SandboxEnvironment
 from inspect_ai.util._span import current_span_id
 
 from .toolview import tool_view
 
-logger = getLogger(__name__)
-
-
-# Minimum prompt length to consider for substring matching. Short prompts
-# could accidentally appear in unrelated content; this guards against false
-# positives while still catching every plausible Task prompt (which are
-# typically full sentences).
-_MIN_PROMPT_LENGTH = 16
-
 
 @dataclass
 class _OpenAgent:
-    """An agent span currently open (Task tool_use seen, no tool_result yet)."""
-
     span_id: str
+    agent_id: str | None = None
+    complete: bool = False
 
 
 class LiveConsumer(ModelEventSink):
-    """Sink + JSONL consumer.
-
-    The bridge calls `on_pending` / `on_complete` for every `ModelEvent`.
-    The runner loop calls `process_jsonl_line` for every JSONL line printed
-    by Claude Code.
-    """
+    """Attribute bridge calls from exact native Claude session identifiers."""
 
     def __init__(self) -> None:
-        # tool_use_id → _OpenAgent for currently-open agent spans (Task/Agent
-        # tool_use blocks we've SpanBegin'd, not yet SpanEnd'd).
         self._open_agents: dict[str, _OpenAgent] = {}
-
-        # tool_use_id → Task prompt for sub-agents currently RUNNING. Populated
-        # in `on_complete` when a parent's output contains Task/Agent tool_calls
-        # (synchronously, before the response is sent back to Claude Code, so
-        # the entry is ready before any sub-agent can make a bridge call).
-        # Cleared in `_handle_user` when the matching tool_result arrives.
-        self._pending_subagents: dict[str, str] = {}
-
-        # Track which event objects we've already _event()'d so on_complete
-        # knows whether to emit _event_updated (yes if we emitted) vs swallow
-        # (no if we didn't — shouldn't happen with current logic but defensive).
+        self._agent_to_tool: dict[str, str] = {}
+        self._response_agents: dict[str, str | None] = {}
+        self._pending_events: dict[int, ModelEvent] = {}
+        self._pending_outer_spans: dict[int, str | None] = {}
+        self._pending_compactions: list[dict[str, Any]] = []
+        self._seen_native_events: set[str] = set()
+        self._sandbox: SandboxEnvironment | None = None
+        self._user: str | None = None
+        self._session_id: str | None = None
+        self._centaur_outer_span_id: str | None = None
         self._emitted_events: set[int] = set()
-
-        # Stop reason of the most recent completed ModelEvent. Used by the
-        # runner loop to distinguish an Anthropic refusal (content_filter)
-        # from a genuine scaffold crash when Claude Code exits non-zero.
         self._last_stop_reason: StopReason | None = None
 
     @property
     def last_stop_reason(self) -> StopReason | None:
-        """Stop reason of the last completed model event this attempt."""
         return self._last_stop_reason
 
     @property
     def outer_span_id(self) -> str | None:
-        """Span for main-agent attribution, resolved at emission time.
-
-        Must not be captured once at construction: with checkpointing
-        active, the enclosing checkpoint span rotates at each fire and a
-        frozen id would pin every event to the first checkpoint.
-        """
         return current_span_id()
 
-    def reset(self) -> None:
-        """Close any open spans and clear per-attempt state.
+    def configure_centaur_session(
+        self, sandbox: SandboxEnvironment, user: str | None, session_id: str
+    ) -> None:
+        """Configure the wrapper-owned transcript source drained by refresh()."""
+        self._sandbox = sandbox
+        self._user = user
+        self._session_id = session_id
+        self._centaur_outer_span_id = self.outer_span_id
 
-        Called between Claude Code subprocess restarts (retry attempts) and
-        in a `finally` after the retry loop. Emits `SpanEndEvent` for every
-        still-open agent span (innermost first) so the transcript stays
-        balanced even if Claude Code crashed before its tool_result blocks
-        were written.
-        """
-        for tool_use_id in reversed(list(self._open_agents.keys())):
-            agent = self._open_agents.pop(tool_use_id)
-            transcript()._event(SpanEndEvent(id=agent.span_id))
-        self._pending_subagents.clear()
+    async def refresh(self, command: str) -> None:
+        """Drain the configured native session before a terminal lifecycle action."""
+        del command
+        if self._sandbox is None or self._session_id is None:
+            raise RuntimeError("Claude Centaur session has not been configured.")
+        session_file = shlex.quote(f"{self._session_id}.jsonl")
+        subagent_file = shlex.quote(f"*/{self._session_id}/subagents/agent-*.jsonl")
+        result = await self._sandbox.exec(
+            [
+                "sh",
+                "-c",
+                'if [ -d "$HOME/.claude/projects" ]; then '
+                f'find "$HOME/.claude/projects" -type f \\( -name {session_file} '
+                f"-o -path {subagent_file} \\) -print; fi",
+            ],
+            user=self._user,
+        )
+        if not result.success:
+            raise RuntimeError(f"Unable to enumerate Claude session transcript: {result.stderr}")
+        for path in result.stdout.splitlines():
+            content = await self._sandbox.read_file(path)
+            for line in content.splitlines():
+                if not line:
+                    continue
+                try:
+                    raw = json.loads(line)
+                except json.JSONDecodeError as ex:
+                    raise RuntimeError(f"Malformed Claude session JSONL in {path}.") from ex
+                if not isinstance(raw, dict):
+                    raise RuntimeError(f"Unexpected non-object Claude session JSONL record in {path}.")
+                self.process_jsonl_line(raw)
+        self._flush_pending_events()
+
+    def reset(self) -> None:
+        """Close outstanding native spans and release buffered bridge events."""
+        pending = list(self._pending_events.values())
+        self._pending_events.clear()
+        self._pending_outer_spans.clear()
+        for event in pending:
+            event.span_id = None
+            self._complete_event(event, emitted=False)
+        for tool_use_id in reversed(list(self._open_agents)):
+            transcript()._event(SpanEndEvent(id=self._open_agents.pop(tool_use_id).span_id))
+        self._agent_to_tool.clear()
+        self._response_agents.clear()
+        self._pending_compactions.clear()
+        self._seen_native_events.clear()
         self._emitted_events.clear()
         self._last_stop_reason = None
-
-    # ------------------------------------------------------------------
-    # ModelEventSink callbacks (called from the bridge)
-    # ------------------------------------------------------------------
+        self._sandbox = None
+        self._user = None
+        self._session_id = None
+        self._centaur_outer_span_id = None
 
     def on_pending(self, event: ModelEvent) -> None:
-        event.span_id = self._attribute(event.input)
+        self._close_bridge_agents(event.input)
+        outer_span_id = self.outer_span_id
+        if self._open_agents:
+            self._pending_events[id(event)] = event
+            self._pending_outer_spans[id(event)] = outer_span_id
+            return
+        event.span_id = outer_span_id
         self._emitted_events.add(id(event))
         transcript()._event(event)
 
     def on_complete(self, event: ModelEvent) -> None:
-        # Record the terminal stop reason (guard against empty choices, where
-        # ModelOutput.stop_reason raises). This fires for sub-agent calls too,
-        # but the runner only consults it on a non-zero exit.
         if event.output and event.output.choices:
             self._last_stop_reason = event.output.stop_reason
+        if id(event) in self._pending_events:
+            self._flush_pending_events()
+            return
+        self._complete_event(event, emitted=id(event) in self._emitted_events)
 
+    def _complete_event(self, event: ModelEvent, *, emitted: bool) -> None:
         msg = event.output.message if event.output else None
         if msg is not None and msg.tool_calls:
-            # Attach custom rendering for Claude Code's built-in tools.
-            # inspect_ai's `tool_call_view` only handles tools registered as
-            # ToolDefs; Claude Code's built-in tools (Write, Task, Agent,
-            # ExitPlanMode, …) aren't, so we fill in our own views here
-            # before `_event_updated` lets the viewer render the call.
-            for tc in msg.tool_calls:
-                if tc.view is None:
-                    custom = tool_view(tc.function, tc.arguments or {})
-                    if custom is not None:
-                        tc.view = custom
-
-            # If this call's response launched any Task/Agent sub-agents,
-            # open their spans and register pending entries NOW —
-            # synchronously, before the bridge response is sent back to
-            # Claude Code. By the time any sub-agent makes its first bridge
-            # call, both `_open_agents` and `_pending_subagents` are ready.
-            parent_span_id = event.span_id or self.outer_span_id
-            for tc in msg.tool_calls:
-                if tc.function not in ("Task", "Agent"):
+            for tool_call in msg.tool_calls:
+                if tool_call.view is None:
+                    tool_call.view = tool_view(tool_call.function, tool_call.arguments or {})
+                if tool_call.function not in ("Task", "Agent") or tool_call.id in self._open_agents:
                     continue
-                args = tc.arguments or {}
-                prompt = args.get("prompt")
-                if not isinstance(prompt, str) or not prompt:
-                    continue
-                if tc.id in self._open_agents:
-                    # idempotent — defensive against retries
-                    continue
-                agent_span_id = f"agent-{tc.id}"
-                self._open_agents[tc.id] = _OpenAgent(span_id=agent_span_id)
-                self._pending_subagents[tc.id] = prompt
-                span_name = args.get("subagent_type") or args.get("name") or "agent"
-                description = args.get("description") or ""
+                args = tool_call.arguments or {}
+                span_id = f"agent-{tool_call.id}"
+                self._open_agents[tool_call.id] = _OpenAgent(span_id)
                 transcript()._event(
                     SpanBeginEvent(
-                        id=agent_span_id,
-                        parent_id=parent_span_id,
+                        id=span_id,
+                        parent_id=event.span_id or self.outer_span_id,
                         type="agent",
-                        name=str(span_name),
-                        metadata={"description": description} if description else None,
+                        name=str(args.get("subagent_type") or args.get("name") or "agent"),
+                        metadata={"description": str(args["description"])} if args.get("description") else None,
                     )
                 )
-
-        if id(event) in self._emitted_events:
+        if emitted:
             self._emitted_events.discard(id(event))
             transcript()._event_updated(event)
-
-    # ------------------------------------------------------------------
-    # JSONL consumer
-    # ------------------------------------------------------------------
+        else:
+            transcript()._event(event)
 
     def process_jsonl_line(self, raw: dict[str, Any]) -> None:
-        """Process one raw JSONL event from Claude Code.
-
-        Called from the runner loop as each JSONL line arrives.
-
-        Note: sub-agent span *opening* is no longer driven from JSONL —
-        it happens in `on_complete` (synchronous with the parent's bridge
-        call, ahead of the race with stdout-buffered JSONL arrival). We
-        only consume `user` (for tool_result → span close) and `system`
-        (for compaction) events here.
-        """
+        native_id = raw.get("uuid")
+        if not isinstance(native_id, str) or not native_id:
+            raise RuntimeError("Claude session event is missing its native UUID.")
+        if native_id in self._seen_native_events:
+            return
+        self._seen_native_events.add(native_id)
         event_type = raw.get("type")
-        if event_type == "user":
+        if event_type == "assistant":
+            self._handle_assistant(raw)
+        elif event_type == "user":
             self._handle_user(raw)
         elif event_type == "system":
             self._handle_system(raw)
+        self._flush_pending_events()
 
-    # ------------------------------------------------------------------
-    # Attribution
-    # ------------------------------------------------------------------
-
-    def _attribute(self, input_messages: list[ChatMessage]) -> str | None:
-        """Resolve the span_id for an incoming bridge call.
-
-        Substring-matches the first user message's text against currently-
-        pending sub-agent prompts. Exactly one match → that sub-agent's
-        span. Zero or multiple matches → outer span.
-        """
-        if not self._pending_subagents:
-            return self.outer_span_id
-
-        user_text = self._first_user_text(input_messages)
-        if not user_text:
-            return self.outer_span_id
-
-        matches: list[str] = []
-        for tool_use_id, prompt in self._pending_subagents.items():
-            if len(prompt) < _MIN_PROMPT_LENGTH:
-                continue
-            if prompt in user_text:
-                matches.append(tool_use_id)
-
-        if len(matches) == 1:
-            agent = self._open_agents.get(matches[0])
-            if agent is not None:
-                return agent.span_id
-        return self.outer_span_id
-
-    @staticmethod
-    def _first_user_text(input_messages: list[ChatMessage]) -> str | None:
-        """Return the text of the first ChatMessageUser past leading system messages."""
-        for msg in input_messages:
-            if isinstance(msg, ChatMessageSystem):
-                continue
-            if isinstance(msg, ChatMessageUser):
-                return msg.text
-            break
-        return None
-
-    # ------------------------------------------------------------------
-    # JSONL event handlers
-    # ------------------------------------------------------------------
+    def _handle_assistant(self, raw: dict[str, Any]) -> None:
+        message = raw.get("message")
+        if not isinstance(message, dict):
+            return
+        response_id = message.get("id")
+        if not isinstance(response_id, str) or not response_id:
+            return
+        agent_id = raw.get("agentId")
+        owner = agent_id if isinstance(agent_id, str) and agent_id else None
+        if (
+            response_id in self._response_agents
+            and self._response_agents[response_id] != owner
+        ):
+            raise RuntimeError("Claude native response ID changed agent ownership.")
+        self._response_agents[response_id] = owner
 
     def _handle_user(self, raw: dict[str, Any]) -> None:
-        """Close agent spans and clear pending-sub-agent entries for tool_result blocks."""
-        message = raw.get("message", {})
-        content = message.get("content", [])
+        message = raw.get("message")
+        content = message.get("content", []) if isinstance(message, dict) else []
         if not isinstance(content, list):
             return
-
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") != "tool_result":
-                continue
-            tool_use_id = block.get("tool_use_id")
-            if not tool_use_id:
-                continue
-            # Clear pending-subagent entry (no-op for non-Task tool_results).
-            self._pending_subagents.pop(tool_use_id, None)
-            agent = self._open_agents.pop(tool_use_id, None)
-            if agent is None:
-                continue
-            transcript()._event(SpanEndEvent(id=agent.span_id))
+        result = raw.get("toolUseResult")
+        agent_id = result.get("agentId", result.get("agent_id")) if isinstance(result, dict) else None
+        agent_id = agent_id if isinstance(agent_id, str) and agent_id else None
+        tool_ids = [
+            block["tool_use_id"] for block in content
+            if isinstance(block, dict) and block.get("type") == "tool_result"
+            and isinstance(block.get("tool_use_id"), str) and block["tool_use_id"]
+        ]
+        if agent_id is not None:
+            if len(tool_ids) != 1:
+                raise RuntimeError("Claude native agent result did not contain one tool result.")
+            self._bind_agent(tool_ids[0], agent_id)
+        for tool_use_id in tool_ids:
+            self._close_agent(tool_use_id)
 
     def _handle_system(self, raw: dict[str, Any]) -> None:
-        """Handle system events (only compaction boundaries today).
-
-        Sub-agent lifecycle (`task_started`/`task_notification`) intentionally
-        ignored: registration happens in `on_complete` (synchronous with the
-        parent's bridge call, ahead of any race), and cleanup happens in
-        `_handle_user` on the matching tool_result.
-        """
-        subtype = raw.get("subtype")
-        if subtype == "compact_boundary":
-            self._handle_compact_boundary(raw)
-
-    def _handle_compact_boundary(self, raw: dict[str, Any]) -> None:
-        parent_tool_use_id = raw.get("parent_tool_use_id")
-        if parent_tool_use_id:
-            parent_agent = self._open_agents.get(parent_tool_use_id)
-            span_id = parent_agent.span_id if parent_agent else self.outer_span_id
+        if raw.get("subtype") != "compact_boundary":
+            return
+        agent_id = raw.get("agentId")
+        tool_id = self._agent_to_tool.get(agent_id) if isinstance(agent_id, str) else None
+        agent = self._open_agents.get(tool_id) if tool_id else None
+        if agent is None and isinstance(agent_id, str) and agent_id:
+            self._pending_compactions.append(raw)
         else:
-            span_id = self.outer_span_id
+            self._emit_compaction(raw, agent.span_id if agent else self._centaur_outer_span_id or self.outer_span_id)
 
-        compact_meta = raw.get("compactMetadata") or {}
+    def _bind_agent(self, tool_use_id: str, agent_id: str) -> None:
+        agent = self._open_agents.get(tool_use_id)
+        if agent is None:
+            return
+        previous = self._agent_to_tool.get(agent_id)
+        if previous is not None and previous != tool_use_id:
+            raise RuntimeError("Claude native agent ID bound to multiple Task calls.")
+        agent.agent_id = agent_id
+        self._agent_to_tool[agent_id] = tool_use_id
+
+    def _close_bridge_agents(self, messages: list[ChatMessage]) -> None:
+        for message in messages:
+            if isinstance(message, ChatMessageTool):
+                self._close_agent(message.tool_call_id)
+
+    def _close_agent(self, tool_use_id: str) -> None:
+        agent = self._open_agents.get(tool_use_id)
+        if agent is not None:
+            agent.complete = True
+        self._close_completed_agents()
+
+    def _close_completed_agents(self) -> None:
+        if self._pending_events or self._pending_compactions:
+            return
+        for tool_id, agent in list(self._open_agents.items()):
+            if agent.complete and agent.agent_id is not None:
+                self._open_agents.pop(tool_id)
+                self._agent_to_tool.pop(agent.agent_id, None)
+                transcript()._event(SpanEndEvent(id=agent.span_id))
+
+    def _flush_pending_events(self) -> None:
+        for event_id, event in list(self._pending_events.items()):
+            response_id = event.output.message.id if event.output else None
+            if response_id not in self._response_agents:
+                continue
+            owner = self._response_agents[response_id]
+            if owner is None:
+                event.span_id = self._pending_outer_spans[event_id]
+            else:
+                tool_id = self._agent_to_tool.get(owner)
+                agent = self._open_agents.get(tool_id) if tool_id else None
+                if agent is None:
+                    continue
+                event.span_id = agent.span_id
+            self._pending_events.pop(event_id)
+            self._pending_outer_spans.pop(event_id)
+            self._complete_event(event, emitted=False)
+        self._flush_pending_compactions()
+        self._close_completed_agents()
+
+    def _flush_pending_compactions(self) -> None:
+        remaining: list[dict[str, Any]] = []
+        for raw in self._pending_compactions:
+            agent_id = raw.get("agentId")
+            tool_id = self._agent_to_tool.get(agent_id) if isinstance(agent_id, str) else None
+            agent = self._open_agents.get(tool_id) if tool_id else None
+            if agent is None:
+                remaining.append(raw)
+            else:
+                self._emit_compaction(raw, agent.span_id)
+        self._pending_compactions = remaining
+
+    def _emit_compaction(self, raw: dict[str, Any], span_id: str | None) -> None:
+        metadata = raw.get("compactMetadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
         transcript()._event(
             CompactionEvent(
                 source="claude_code",
-                tokens_before=compact_meta.get("preTokens"),
+                tokens_before=metadata.get("preTokens"),
                 span_id=span_id,
                 metadata={
-                    "trigger": compact_meta.get("trigger", "auto"),
+                    "trigger": metadata.get("trigger", "auto"),
                     "content": raw.get("content") or "Conversation compacted",
                 },
             )

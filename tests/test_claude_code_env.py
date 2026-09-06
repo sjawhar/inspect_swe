@@ -13,6 +13,8 @@ non-blocking -- so a test that merely asserts "the key is present" would pass
 against a value that reintroduces the bug.
 """
 
+import pytest
+
 from inspect_swe._claude_code.env import (
     BLOCKING_MCP_ENV,
     FALSY_ENV_VALUES,
@@ -84,3 +86,23 @@ def test_caller_can_override_the_mcp_defaults() -> None:
 def test_blocking_mcp_env_is_applied_verbatim() -> None:
     env = _env()
     assert {k: env[k] for k in BLOCKING_MCP_ENV} == dict(BLOCKING_MCP_ENV)
+
+
+def test_dynamic_model_resolution_has_no_static_model_environment() -> None:
+    env = claude_code_agent_env(bridge_port=13337, models=None)
+
+    assert "ANTHROPIC_MODEL" not in env
+    assert "ANTHROPIC_DEFAULT_OPUS_MODEL" not in env
+    assert "ANTHROPIC_DEFAULT_SONNET_MODEL" not in env
+    assert "ANTHROPIC_DEFAULT_HAIKU_MODEL" not in env
+    assert "CLAUDE_CODE_SUBAGENT_MODEL" not in env
+    assert "ANTHROPIC_SMALL_FAST_MODEL" not in env
+
+
+def test_dynamic_model_resolution_rejects_static_model_environment() -> None:
+    with pytest.raises(ValueError, match="Dynamic model resolution"):
+        claude_code_agent_env(
+            bridge_port=13337,
+            models=None,
+            env={"ANTHROPIC_MODEL": "claude-sonnet-4-5"},
+        )

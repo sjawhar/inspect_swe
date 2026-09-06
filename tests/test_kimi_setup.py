@@ -41,7 +41,7 @@ from inspect_swe._kimi_code.kimi_code import (
     _strip_repeat_reminders,
     kimi_code,
 )
-from inspect_swe._util.centaur import CentaurOptions
+from inspect_swe._util.centaur import CentaurOptions, CentaurSession
 
 from tests.conftest import skip_if_github_action
 
@@ -439,12 +439,12 @@ def test_run_kimi_code_centaur_forwards_user_and_commands_filter() -> None:
         options: CentaurOptions,
         instructions: str,
         bashrc: str,
-        state: AgentState,
-        user: str | None = None,
-        commands_filter: object = None,
-    ) -> None:
-        captured["user"] = user
+        session: CentaurSession,
+        commands_filter: object | None = None,
+    ) -> AgentState:
+        captured["user"] = session.user
         captured["commands_filter"] = commands_filter
+        return session.state
 
     with patch.object(_KIMI_CODE_MODULE, "run_centaur", fake_run_centaur):
         anyio.run(
@@ -452,8 +452,16 @@ def test_run_kimi_code_centaur_forwards_user_and_commands_filter() -> None:
             CentaurOptions(),
             ["kimi"],
             {},
-            AgentState(messages=[]),
-            "agent",
+            CentaurSession(
+                state=AgentState(messages=[]),
+                invocation=("kimi",),
+                environment={},
+                cwd="/work",
+                user="agent",
+                sandbox=Mock(),
+                bridge_port=0,
+                session_id=None,
+            ),
             _commands_filter,
         )
 
@@ -484,12 +492,12 @@ def test_kimi_code_factory_forwards_user_and_commands_filter_to_centaur_dispatch
         options: CentaurOptions,
         kimi_cmd: list[str],
         agent_env: dict[str, str],
-        state: AgentState,
-        user: str | None = None,
-        commands_filter: object = None,
-    ) -> None:
-        captured["user"] = user
+        session: CentaurSession,
+        commands_filter: object | None = None,
+    ) -> AgentState:
+        captured["user"] = session.user
         captured["commands_filter"] = commands_filter
+        return session.state
 
     sbox = Mock()
     sbox.exec = AsyncMock(return_value=SimpleNamespace(stdout="/root\n"))

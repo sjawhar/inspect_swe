@@ -28,6 +28,7 @@ from inspect_ai.model import (
     GenerateInput,
     Model,
     ModelOutput,
+    ModelResolver,
     get_model_info,
 )
 from inspect_ai.scorer import score
@@ -46,7 +47,12 @@ from inspect_ai.util import store
 from inspect_ai.util._sandbox import ExecRemoteAwaitableOptions
 
 from inspect_swe._util._async import is_callable_coroutine
-from inspect_swe._util.centaur import CentaurOptions, CommandsFilter, run_centaur
+from inspect_swe._util.centaur import (
+    CentaurOptions,
+    CentaurSession,
+    CommandsFilter,
+    run_centaur,
+)
 from inspect_swe._util.mcp_ready import (
     DEFAULT_MCP_READY_TIMEOUT,
     wait_for_mcp_endpoints,
@@ -132,6 +138,8 @@ def kimi_code(
     debug: bool = False,
     *,
     commands_filter: CommandsFilter | None = None,
+    model_resolver: ModelResolver | None = None,
+    accumulate_conversations: bool = False,
 ) -> Agent:
     """Kimi Code agent.
 
@@ -246,6 +254,8 @@ def kimi_code(
             # granted unconditionally to preserve today's behaviour; a grant is
             # inert unless the CLI declares a native web tool
             web_search=True,
+            model_resolver=model_resolver,
+            accumulate_conversations=accumulate_conversations,
         ) as bridge:
             # resolve sandbox
             sbox = sandbox_env(sandbox)
@@ -328,12 +338,20 @@ def kimi_code(
                 )
 
             if centaur:
-                await _run_kimi_code_centaur(
+                return await _run_kimi_code_centaur(
                     options=centaur,
                     kimi_cmd=cmd,
                     agent_env=agent_env,
-                    state=state,
-                    user=user,
+                    session=CentaurSession(
+                        state=bridge.state,
+                        invocation=tuple(cmd),
+                        environment=agent_env,
+                        cwd=agent_cwd,
+                        user=user,
+                        sandbox=sbox,
+                        bridge_port=bridge.port,
+                        session_id=None,
+                    ),
                     commands_filter=commands_filter,
                 )
             else:
@@ -601,10 +619,9 @@ async def _run_kimi_code_centaur(
     options: CentaurOptions,
     kimi_cmd: list[str],
     agent_env: dict[str, str],
-    state: AgentState,
-    user: str | None = None,
+    session: CentaurSession,
     commands_filter: CommandsFilter | None = None,
-) -> None:
+) -> AgentState:
     instructions = (
         "Kimi Code:\n\n"
         " - You may also use Kimi Code via the 'kimi' command.\n"
@@ -616,8 +633,10 @@ async def _run_kimi_code_centaur(
     agent_env_vars = [f'export {k}="{v}"' for k, v in centaur_env.items()]
     alias_cmd = shlex.join(kimi_cmd)
     alias_cmd = "alias kimi='" + alias_cmd.replace("'", "'\\''") + "'"
-    bashrc = "\n".join(agent_env_vars + ["", alias_cmd])
+    bashrc = "\n".join(
+        agent_env_vars + ["", alias_cmd, f"cd -- {shlex.quote(session.cwd)}"]
+    )
 
-    await run_centaur(
-        options, instructions, bashrc, state, user=user, commands_filter=commands_filter
+    return await run_centaur(
+        options, instructions, bashrc, session, commands_filter=commands_filter
     )
