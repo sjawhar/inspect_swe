@@ -15,7 +15,6 @@ from .._util.sandbox import (
     bash_command,
     detect_sandbox_platform,
 )
-from .._util.versioncache import cached_version_resolution
 
 
 async def ensure_gemini_cli_setup(
@@ -23,14 +22,16 @@ async def ensure_gemini_cli_setup(
     version: Literal["auto", "sandbox", "stable", "latest"] | str,
     user: str | None,
 ) -> tuple[str, str]:
-    """Install node and gemini-cli in the sandbox.
+    """Install node and Gemini CLI in the sandbox.
 
-    Returns (gemini_binary, node_binary) paths.
+    Returns the Gemini executable and Node.js binary paths.
     """
+
     platform = await detect_sandbox_platform(sandbox)
     node_binary = await ensure_node_available(sandbox, platform, user)
     if version == "sandbox":
         return await _sandbox_gemini_binary(sandbox, node_binary, user), node_binary
+
     gemini_version = await resolve_gemini_version(version)
     gemini_binary = await ensure_gemini_cli_installed(
         sandbox, node_binary, gemini_version, platform, user
@@ -38,10 +39,21 @@ async def ensure_gemini_cli_setup(
     return gemini_binary, node_binary
 
 
+async def resolve_gemini_version(
+    version: Literal["auto", "sandbox", "stable", "latest"] | str,
+) -> str:
+    """Resolve version string to an actual semver version."""
+    if version in ["auto", "sandbox", "stable", "latest"]:
+        release = await _fetch_latest_release()
+        return str(release["tag_name"]).lstrip("v")
+
+    return version
+
+
 async def _sandbox_gemini_binary(
     sandbox: SandboxEnvironment, node_path: str, user: str | None
 ) -> str:
-    """Return the pre-attached Gemini executable without release resolution."""
+    """Return the pre-attached Gemini executable without consulting a release channel."""
     result = await sandbox.exec(bash_command("which gemini"), user=user)
     if not result.success or not result.stdout.strip():
         raise RuntimeError(
@@ -49,8 +61,7 @@ async def _sandbox_gemini_binary(
         )
     gemini_binary = result.stdout.strip()
     version_result = await sandbox.exec(
-        cmd=[node_path, gemini_binary, "--version"],
-        user=user,
+        cmd=[node_path, gemini_binary, "--version"], user=user
     )
     if not version_result.success:
         raise RuntimeError(
@@ -59,25 +70,6 @@ async def _sandbox_gemini_binary(
             f"stderr: {version_result.stderr}"
         )
     return gemini_binary
-
-
-async def resolve_gemini_version(
-    version: Literal["auto", "sandbox", "stable", "latest"] | str,
-) -> str:
-    """Resolve version string to an actual semver version."""
-    if version in ["auto", "sandbox", "stable", "latest"]:
-        # cached so concurrent samples don't each hit the (rate-limited)
-        # GitHub API — all four aliases resolve to the same latest release
-        return await cached_version_resolution("gemini-cli", _fetch_latest_version)
-
-    return version
-
-
-async def _fetch_latest_version() -> str:
-    """Fetch the latest released gemini-cli version from GitHub."""
-    release = await _fetch_latest_release()
-    return str(release["tag_name"]).lstrip("v")
-
 
 async def ensure_gemini_cli_installed(
     sandbox: SandboxEnvironment,
