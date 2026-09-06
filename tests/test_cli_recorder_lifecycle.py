@@ -75,7 +75,17 @@ def test_claude_binds_overlapping_child_call_from_native_response_and_agent_ids(
     first_child = _model_event(
         [],
         ModelOutput.from_message(
-            ChatMessageAssistant(id="response-child-1", content="first result")
+            ChatMessageAssistant(
+                id="response-child-1",
+                content="first result",
+                tool_calls=[
+                    ToolCall(
+                        id="child-bash-1",
+                        function="Bash",
+                        arguments={"command": "printf child"},
+                    )
+                ],
+            )
         ),
     )
     # The first child starts with the parent's model, then switches models
