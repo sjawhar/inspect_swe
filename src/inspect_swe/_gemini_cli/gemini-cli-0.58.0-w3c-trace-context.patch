@@ -53,3 +53,14 @@
        } catch (error40) {
          const durationMs = Date.now() - startTime;
          this._fixGaxiosErrorData(error40);
+@@ -366150,7 +366150,9 @@
+       const firstItem = result2.content[0];
+       if (firstItem.type === "text" && typeof firstItem.text === "string") {
+         try {
+           const parsed = JSON.parse(firstItem.text);
+-          result2.structuredContent = parsed;
++          if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
++            result2.structuredContent = parsed;
++          }
+         } catch {
+         }

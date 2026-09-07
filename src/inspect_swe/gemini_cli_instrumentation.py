@@ -1,4 +1,4 @@
-"""Integrity-pinned W3C trace-context instrumentation for Gemini CLI 0.58.0."""
+"""Integrity-pinned instrumentation and MCP compliance repair for Gemini CLI 0.58.0."""
 
 from __future__ import annotations
 
@@ -42,9 +42,9 @@ GEMINI_CLI_TRACE_CONTEXT_CONTRACT: Final = GeminiCliTraceContextContract(
     target_relative_path=PurePosixPath(
         "node_modules/@google/gemini-cli/bundle/chunk-MFLFXOVQ.js"
     ),
-    patch_sha256="2fc45edf7f28fc18838ef30cbe6587da17660723a0649d37d86e8741520f862e",
+    patch_sha256="9ae5330521ddc6ef488eb6d42c8c169d2ae7461e000a16c511faa587966a272f",
     preimage_sha256="5934d3b3bd7fc8ea0c853b9a79e3832b51dda7c2522929d1cc3c03239dea2fde",
-    postimage_sha256="db1e8d52c34f98449680b99e9ff05acce1a1e5ff7d7f3da167fd6ca4edef0f57",
+    postimage_sha256="a4fa563dbcd792a72f7ce2d03338cbc70f90430b5647cc6b5dcc76c1464a5689",
 )
 GEMINI_CLI_TRACE_CONTEXT_CACHE_REVISION: Final = (
     f"w3c-trace-context-{GEMINI_CLI_TRACE_CONTEXT_CONTRACT.patch_sha256[:12]}"

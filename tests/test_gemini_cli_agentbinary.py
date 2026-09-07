@@ -10,6 +10,7 @@ import pytest
 from inspect_swe._gemini_cli import agentbinary
 from inspect_swe.gemini_cli_instrumentation import (
     GEMINI_CLI_INSTRUMENTED_VERSION,
+    GEMINI_CLI_TRACE_CONTEXT_CACHE_REVISION,
     GeminiCliInstrumentationError,
 )
 
@@ -33,7 +34,9 @@ def _marker_from_bundle(bundle_data: bytes) -> str:
 
 def _instrumented_cache_path(cache_dir: Path) -> Path:
     return cache_dir / (
-        "gemini-cli-instrumented-w3c-trace-context-2fc45edf7f28-0.58.0-linux-x64.tar.gz"
+        "gemini-cli-instrumented-"
+        f"{GEMINI_CLI_TRACE_CONTEXT_CACHE_REVISION}-"
+        f"{GEMINI_CLI_INSTRUMENTED_VERSION}-linux-x64.tar.gz"
     )
 
 

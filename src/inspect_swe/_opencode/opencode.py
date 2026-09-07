@@ -237,6 +237,7 @@ def opencode(
                 }
             opencode_config: dict[str, Any] = {
                 "$schema": "https://opencode.ai/config.json",
+                "model": opencode_model,
                 "provider": provider_configs,
             }
             if provider_id == "google":

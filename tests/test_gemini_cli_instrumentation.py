@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -119,4 +120,182 @@ def test_canonical_patch_resource_and_cache_identity_are_exact() -> None:
     assert _sha256(instrumentation._load_patch_resource()) == contract.patch_sha256
     assert instrumentation.GEMINI_CLI_TRACE_CONTEXT_CACHE_REVISION == (
         f"w3c-trace-context-{contract.patch_sha256[:12]}"
+    )
+
+
+_PATCH_FIXTURE = """    mcp_servers: mcpServers
+  };
+}
+var LoggingContentGenerator = class {
+  wrapped;
+  config;
+      const serverDetails = this._getEndpointUrl(req, "generateContent");
+      this.logApiRequest(contents, req.model, userPromptId, role, req.config, serverDetails);
+      try {
+        const response = await this.wrapped.generateContent(req, userPromptId, role);
+        spanMetadata.output = response.candidates?.[0]?.content ?? null;
+        spanMetadata.attributes[GEN_AI_USAGE_INPUT_TOKENS] = response.usageMetadata?.promptTokenCount ?? 0;
+        spanMetadata.attributes[GEN_AI_USAGE_OUTPUT_TOKENS] = response.usageMetadata?.candidatesTokenCount ?? 0;
+      this.logApiRequest(toContents(req.contents), req.model, userPromptId, role, req.config, serverDetails);
+      let stream2;
+      try {
+        stream2 = await this.wrapped.generateContentStream(req, userPromptId, role);
+      } catch (error40) {
+        const durationMs = Date.now() - startTime;
+        this._fixGaxiosErrorData(error40);
+var McpComplianceTransport = class extends EventEmitter8 {
+  transport;
+  constructor(transport) {
+    super();
+    this.transport = transport;
+    this.transport.onmessage = (message) => {
+      this.handleMessage(message);
+    };
+    this.transport.onclose = () => {
+      this.onclose?.();
+    };
+    this.transport.onerror = (error40) => {
+      this.onerror?.(error40);
+    };
+  }
+  onclose;
+  onerror;
+  onmessage;
+  async start() {
+    await this.transport.start();
+  }
+  async close() {
+    await this.transport.close();
+  }
+  async send(message) {
+    await this.transport.send(message);
+  }
+  handleMessage(message) {
+    if (this.isJsonResponse(message)) {
+      this.fixStructuredContent(message);
+    }
+    this.onmessage?.(message);
+  }
+  isJsonResponse(message) {
+    return "result" in message || "error" in message;
+  }
+  fixStructuredContent(response) {
+    if (!("result" in response))
+      return;
+    const result2 = response.result;
+    if (result2.content && Array.isArray(result2.content) && result2.content.length > 0 && !result2.structuredContent) {
+      const firstItem = result2.content[0];
+      if (firstItem.type === "text" && typeof firstItem.text === "string") {
+        try {
+          const parsed = JSON.parse(firstItem.text);
+          result2.structuredContent = parsed;
+        } catch {
+        }
+      }
+    }
+  }
+};
+"""
+
+
+def _patched_transport_class() -> str:
+    contract = instrumentation.GEMINI_CLI_TRACE_CONTEXT_CONTRACT
+    patched = instrumentation._apply_exact_unified_patch(
+        _PATCH_FIXTURE,
+        instrumentation._load_patch_resource().decode("utf-8"),
+        contract.target_relative_path,
+    )
+    start = patched.index("var McpComplianceTransport = class extends EventEmitter8 {")
+    end = patched.index("\n};", start) + len("\n};")
+    return patched[start:end]
+
+
+def test_patched_transport_keeps_nonrecord_json_out_of_structured_content(
+    tmp_path: Path,
+) -> None:
+    """Run the exact bundle patch over the real transport normalization behavior."""
+    transport = _patched_transport_class()
+    script = tmp_path / "mcp_compliance_transport.mjs"
+    script.write_text(
+        "class EventEmitter8 {}\n"
+        + transport
+        + """
+const transport = new McpComplianceTransport({
+  start: async () => {},
+  close: async () => {},
+  send: async () => {},
+});
+const cases = [
+  {
+    name: "object",
+    text: '{"price":34.99,"rating":4.6}',
+    expected: { price: 34.99, rating: 4.6 },
+    isError: false,
+  },
+  {
+    name: "array",
+    text: '["not","a","record"]',
+    expected: undefined,
+    isError: false,
+  },
+  {
+    name: "primitive",
+    text: "42",
+    expected: undefined,
+    isError: false,
+  },
+  {
+    name: "null",
+    text: "null",
+    expected: undefined,
+    isError: false,
+  },
+  {
+    name: "existing",
+    text: '["ignored"]',
+    structuredContent: { nested: { preserved: true } },
+    expected: { nested: { preserved: true } },
+    isError: true,
+  },
+];
+let passed = true;
+for (const item of cases) {
+  const response = {
+    result: {
+      content: [{ type: "text", text: item.text }],
+      ...(item.structuredContent === undefined
+        ? {}
+        : { structuredContent: item.structuredContent }),
+      isError: item.isError,
+    },
+  };
+  const originalContent = JSON.stringify(response.result.content);
+  transport.handleMessage(response);
+  const contentPreserved =
+    JSON.stringify(response.result.content) === originalContent;
+  const structuredContentPreserved =
+    item.expected === undefined
+      ? response.result.structuredContent === undefined
+      : JSON.stringify(response.result.structuredContent) ===
+        JSON.stringify(item.expected);
+  const errorPreserved = response.result.isError === item.isError;
+  const result = contentPreserved && structuredContentPreserved && errorPreserved;
+  console.log(`${item.name}: ${result}`);
+  passed &&= result;
+}
+process.exitCode = passed ? 0 : 1;
+""",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["node", str(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == (
+        "object: true\narray: true\nprimitive: true\nnull: true\nexisting: true\n"
     )

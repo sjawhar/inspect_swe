@@ -10,12 +10,11 @@ from typing import AsyncIterator
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from inspect_ai.agent import AgentState
+from inspect_ai.agent import AgentState, HumanAgentCommand
 from inspect_swe._util.centaur import (
     CentaurOptions,
     CentaurSession,
     CommandsFilter,
-    HumanAgentCommand,
 )
 
 
@@ -84,7 +83,7 @@ class _Store:
         ),
     ],
 )
-def test_native_factory_configures_selected_and_google_routes_with_bare_operator_alias(
+def test_native_factory_defaults_bare_operator_to_selected_model(
     opencode_model: str,
     expected_provider: dict[str, object],
     expected_title_agent: dict[str, dict[str, str]] | None,
@@ -155,6 +154,7 @@ def test_native_factory_configures_selected_and_google_routes_with_bare_operator
     assert bridge_options["model_resolver"] is resolver
     assert centaur_call["commands_filter"] is commands_filter
     assert config["provider"] == expected_provider
+    assert config["model"] == opencode_model
     if expected_title_agent is None:
         assert "agent" not in config
     else:
@@ -163,6 +163,7 @@ def test_native_factory_configures_selected_and_google_routes_with_bare_operator
     assert isinstance(bashrc, str)
     assert "alias opencode=/opt/opencode" in bashrc
     assert "alias opencode='/opt/opencode run" not in bashrc
+    assert "GOOGLE_GENERATIVE_AI_API_KEY" in bashrc
     session = centaur_call["session"]
     assert isinstance(session, CentaurSession)
     assert session.invocation == (
@@ -173,6 +174,7 @@ def test_native_factory_configures_selected_and_google_routes_with_bare_operator
         "--format",
         "json",
     )
+
 
 def test_opencode_exposes_resolver_without_provider_configuration() -> None:
     """Keep bridge routing public without leaking OpenCode provider internals."""
