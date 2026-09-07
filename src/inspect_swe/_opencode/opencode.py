@@ -150,8 +150,8 @@ def opencode(
     # resolve attempts
     attempts = AgentAttempts(attempts) if isinstance(attempts, int) else attempts
 
-    # determine which provider client opencode will use, so we know which
-    # provider entry's baseURL to override in the config (the bridge intercepts
+    # Keep the requested provider's bridge route configured even when a Centaur
+    # operator chooses another supported provider through the bare binary alias.
     provider_id, separator, provider_model_id = opencode_model.partition("/")
     if not separator:
         provider_id = "anthropic"
@@ -216,17 +216,25 @@ def opencode(
             provider_configs: dict[str, Any] = {
                 "anthropic": {"options": {"baseURL": f"{bridge_url}/v1"}}
             }
-            if provider_id == "google":
-                if not provider_model_id:
-                    raise ValueError("opencode_model must name a Google model after 'google/'")
-                provider_configs["google"] = {
-                    "npm": "@ai-sdk/google",
-                    "models": {provider_model_id: {"name": provider_model_id}},
-                    "options": {
-                        "apiKey": "sk-none",
-                        "baseURL": f"{bridge_url}/v1beta",
-                    },
+            if provider_id != "google":
+                provider_configs[provider_id] = {
+                    "options": {"baseURL": f"{bridge_url}/v1"}
                 }
+            google_model_id = (
+                provider_model_id if provider_id == "google" else "gdm-fsm-plum"
+            )
+            if not google_model_id:
+                raise ValueError(
+                    "opencode_model must name a Google model after 'google/'"
+                )
+            provider_configs["google"] = {
+                "npm": "@ai-sdk/google",
+                "models": {google_model_id: {"name": google_model_id}},
+                "options": {
+                    "apiKey": "sk-none",
+                    "baseURL": f"{bridge_url}/v1beta",
+                },
+            }
             opencode_config: dict[str, Any] = {
                 "$schema": "https://opencode.ai/config.json",
                 "provider": provider_configs,

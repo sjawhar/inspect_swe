@@ -76,8 +76,7 @@ def test_run_centaur_forwards_user_and_commands_filter(
             CentaurOptions(),
             instructions="instr",
             bashrc="bashrc",
-            session=_session(AgentState(messages=[])),
-            user="agent",
+            session=_session(AgentState(messages=[]), user="agent"),
             commands_filter=_commands_filter,
         )
     )
