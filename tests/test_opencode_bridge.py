@@ -11,6 +11,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from inspect_ai.agent import AgentState, HumanAgentCommand
+from inspect_ai.agent._bridge.util import resolve_inspect_model
+from inspect_ai.model import Model, get_model
 from inspect_swe._util.centaur import (
     CentaurOptions,
     CentaurSession,
@@ -67,7 +69,13 @@ class _Store:
 
 
 @pytest.mark.parametrize(
-    ("opencode_model", "expected_provider", "expected_title_agent"),
+    (
+        "opencode_model",
+        "expected_provider",
+        "expected_title_agent",
+        "with_resolver",
+        "expected_bridge_model",
+    ),
     [
         (
             "google/gdm-fsm-plum",
@@ -83,6 +91,25 @@ class _Store:
                 },
             },
             {"title": {"model": "google/gdm-fsm-plum"}},
+            True,
+            None,
+        ),
+        (
+            "google/gdm-fsm-plum",
+            {
+                "anthropic": {"options": {"baseURL": "http://localhost:8901/v1"}},
+                "google": {
+                    "npm": "@ai-sdk/google",
+                    "models": {"gdm-fsm-plum": {"name": "gdm-fsm-plum"}},
+                    "options": {
+                        "apiKey": "sk-none",
+                        "baseURL": "http://localhost:8901/v1beta",
+                    },
+                },
+            },
+            {"title": {"model": "google/gdm-fsm-plum"}},
+            False,
+            "inspect",
         ),
         (
             "openai/gpt-5",
@@ -98,6 +125,8 @@ class _Store:
                 },
             },
             None,
+            True,
+            None,
         ),
     ],
 )
@@ -105,6 +134,8 @@ def test_native_factory_defaults_bare_operator_to_selected_model(
     opencode_model: str,
     expected_provider: dict[str, object],
     expected_title_agent: dict[str, dict[str, str]] | None,
+    with_resolver: bool,
+    expected_bridge_model: str | None,
 ) -> None:
     module = importlib.import_module("inspect_swe._opencode.opencode")
     state = AgentState(messages=[])
@@ -168,7 +199,7 @@ def test_native_factory_defaults_bare_operator_to_selected_model(
                 centaur=CentaurOptions(answer=False),
                 commands_filter=commands_filter,
                 opencode_model=opencode_model,
-                model_resolver=resolver,
+                model_resolver=resolver if with_resolver else None,
             )(state)
         )
     config = json.loads(sbox.files["/home/agent/.inspect_swe/opencode/opencode.json"])
@@ -197,7 +228,8 @@ def test_native_factory_defaults_bare_operator_to_selected_model(
         None,
     )
 
-    assert bridge_options["model_resolver"] is resolver
+    assert bridge_options["model"] == expected_bridge_model
+    assert bridge_options["model_resolver"] is (resolver if with_resolver else None)
     assert centaur_call["commands_filter"] is commands_filter
     assert config["provider"] == expected_provider
     assert config["model"] == opencode_model
@@ -229,3 +261,38 @@ def test_opencode_exposes_resolver_without_provider_configuration() -> None:
 
     assert parameters["model_resolver"].default is None
     assert "provider_config" not in parameters
+
+
+def test_deferred_google_role_beats_active_anthropic_model() -> None:
+    """A deferred native Google request reaches its declared role, not the judge."""
+    declared_google = get_model("mockllm/declared-google")
+    active_anthropic = get_model("mockllm/active-anthropic")
+    requested_models: list[str] = []
+
+    def defer(requested_model: str) -> None:
+        requested_models.append(requested_model)
+        return None
+
+    def declared_role(*, role: str) -> Model:
+        assert role == "google/gdm-fsm-plum"
+        return declared_google
+
+    bridge_util = importlib.import_module("inspect_ai.agent._bridge.util")
+    with (
+        patch.object(
+            bridge_util,
+            "model_roles",
+            return_value={"google/gdm-fsm-plum": declared_google},
+        ),
+        patch.object(bridge_util, "get_model", side_effect=declared_role),
+        patch.object(bridge_util, "active_model", return_value=active_anthropic),
+    ):
+        resolved = resolve_inspect_model(
+            "gdm-fsm-plum",
+            fallback_model=None,
+            model_resolver=defer,
+            provider="google",
+        )
+
+    assert requested_models == ["google/gdm-fsm-plum"]
+    assert resolved is declared_google

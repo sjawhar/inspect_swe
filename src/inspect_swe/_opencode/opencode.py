@@ -246,7 +246,13 @@ def opencode(
         centaur = CentaurOptions()
 
     # resolve model
-    model = f"inspect/{model}" if model is not None else "inspect"
+    model = (
+        f"inspect/{model}"
+        if model is not None
+        else "inspect"
+        if model_resolver is None
+        else None
+    )
 
     # resolve skills
     resolved_skills = read_skills(skills) if skills is not None else None
