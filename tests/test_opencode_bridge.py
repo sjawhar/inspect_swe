@@ -31,7 +31,7 @@ class _Sandbox:
         assert user is None
         if cmd == ["sh", "-c", "echo $HOME"]:
             return _ExecResult("/home/agent\n")
-        assert cmd == ["mkdir", "-p", "/home/agent/.config/opencode"]
+        assert cmd == ["mkdir", "-p", "/home/agent/.inspect_swe/opencode"]
         return _ExecResult()
 
     async def write_file(self, path: str, contents: str) -> None:
@@ -149,7 +149,7 @@ def test_native_factory_defaults_bare_operator_to_selected_model(
                 model_resolver=resolver,
             )(state)
         )
-    config = json.loads(sbox.files["/home/agent/.config/opencode/opencode.json"])
+    config = json.loads(sbox.files["/home/agent/.inspect_swe/opencode/opencode.json"])
 
     assert bridge_options["model_resolver"] is resolver
     assert centaur_call["commands_filter"] is commands_filter

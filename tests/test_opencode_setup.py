@@ -15,6 +15,7 @@ from inspect_ai import Task, eval
 from inspect_ai.dataset import Sample
 from inspect_ai.scorer import Score, Scorer, Target, scorer
 from inspect_ai.solver import Generate, Solver, TaskState, solver
+from inspect_ai.util import SandboxEnvironment
 from inspect_swe._opencode import agentbinary
 from inspect_swe._opencode.agentbinary import ensure_opencode_setup
 from inspect_swe._util import node as node_util
