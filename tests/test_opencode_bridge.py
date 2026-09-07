@@ -11,7 +11,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from inspect_ai.agent import AgentState
-from inspect_swe._util.centaur import CentaurOptions, CentaurSession, CommandsFilter
+from inspect_swe._util.centaur import (
+    CentaurOptions,
+    CentaurSession,
+    CommandsFilter,
+    HumanAgentCommand,
+)
 
 
 class _ExecResult:
@@ -118,7 +123,12 @@ def test_native_factory_configures_selected_and_google_routes_with_bare_operator
         )
         return session.state
 
-    commands_filter: CommandsFilter = lambda commands: commands
+    def identity_commands_filter(
+        commands: list[HumanAgentCommand],
+    ) -> list[HumanAgentCommand]:
+        return commands
+
+    commands_filter: CommandsFilter = identity_commands_filter
     with (
         patch.object(module, "sandbox_env", return_value=sbox),
         patch.object(module, "store", return_value=_Store()),
