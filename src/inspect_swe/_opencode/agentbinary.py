@@ -386,7 +386,6 @@ async def _local_config_dependency_seed(
     return seed_dir
 
 
-
 def _config_dependency_staging_dir(config_dir: str, cli_version: str) -> str:
     return f"{config_dir}.inspect-swe-opencode-deps-{cli_version}.staging"
 
@@ -446,7 +445,7 @@ async def _hook_owned_config_preparation(
         bash_command(
             "# opencode-config-dependency-preparation\n"
             f"[ -f {marker} ] && "
-            f"[ \"$(cat {marker})\" = {expected_contents} ] && "
+            f'[ "$(cat {marker})" = {expected_contents} ] && '
             "echo present || echo absent"
         ),
         user=user,
@@ -496,9 +495,7 @@ async def _stage_config_dependency_tree(
     staging_dir = _config_dependency_staging_dir(config_dir, cli_version)
     staging = shlex.quote(staging_dir)
     marker = shlex.quote(_config_dependency_preparation_marker(config_dir, cli_version))
-    marker_contents = shlex.quote(
-        _config_dependency_preparation_contents(cli_version)
-    )
+    marker_contents = shlex.quote(_config_dependency_preparation_contents(cli_version))
     result = await sandbox.exec(
         bash_command(
             f"rm -rf -- {staging} && "
@@ -538,6 +535,7 @@ async def _stage_config_dependency_tree(
         sandbox, node_binary, config_dir, cli_version, user
     )
 
+
 async def _config_dependency_state(
     sandbox: SandboxEnvironment, config_dir: str, user: str | None
 ) -> Literal["empty", "complete", "partial"]:
@@ -549,8 +547,8 @@ async def _config_dependency_state(
             f"[ -e {quoted_dir}/package.json ] && metadata=$((metadata + 1)); "
             f"[ -e {quoted_dir}/package-lock.json ] && metadata=$((metadata + 1)); "
             f"[ -e {quoted_dir}/node_modules ] && metadata=$((metadata + 1)); "
-            f"if [ \"$metadata\" -eq 0 ]; then echo empty; "
-            f"elif [ \"$metadata\" -eq 3 ]; then echo complete; "
+            f'if [ "$metadata" -eq 0 ]; then echo empty; '
+            f'elif [ "$metadata" -eq 3 ]; then echo complete; '
             f"else echo partial; fi"
         ),
         user=user,

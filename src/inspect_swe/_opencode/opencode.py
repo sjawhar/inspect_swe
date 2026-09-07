@@ -25,9 +25,8 @@ from inspect_ai.model import (
 from inspect_ai.scorer import score
 from inspect_ai.tool import MCPServerConfig, Skill, install_skills, read_skills
 from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
-from inspect_ai.util import SandboxEnvironment
+from inspect_ai.util import SandboxEnvironment, store
 from inspect_ai.util import sandbox as sandbox_env
-from inspect_ai.util import store
 from inspect_ai.util._sandbox import ExecRemoteAwaitableOptions
 
 from inspect_swe._util._async import is_callable_coroutine
@@ -74,9 +73,7 @@ def _opencode_config_paths(
 ) -> _OpenCodeConfigPaths:
     effective_home = launch_env.get("HOME", sandbox_home)
     native_home = launch_env.get("OPENCODE_TEST_HOME", effective_home)
-    xdg_config_home = launch_env.get(
-        "XDG_CONFIG_HOME", f"{effective_home}/.config"
-    )
+    xdg_config_home = launch_env.get("XDG_CONFIG_HOME", f"{effective_home}/.config")
     return _OpenCodeConfigPaths(
         wrapper_dir=f"{sandbox_home}/.inspect_swe/opencode",
         native_home=native_home,
@@ -101,7 +98,8 @@ async def _native_opencode_config_dirs(
         )
         worktree = (
             worktree_result.stdout.strip()
-            if worktree_result.success and worktree_result.stdout.strip().startswith("/")
+            if worktree_result.success
+            and worktree_result.stdout.strip().startswith("/")
             else "/"
         )
         project_result = await sandbox.exec(

@@ -4,7 +4,6 @@ import importlib
 import os
 import shutil
 import subprocess
-
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -259,7 +258,6 @@ def test_ensure_opencode_setup_delegates_to_ensure_agent_binary_installed() -> N
     assert dependency_bin_dirs == ["/usr/local/bin", "/usr/local/bin"]
 
 
-
 class _ConfigDependencySandbox:
     """Structural sandbox fake for OpenCode's pre-plugin dependency preparation."""
 
@@ -276,9 +274,7 @@ class _ConfigDependencySandbox:
         self.exec_calls: list[tuple[list[str], dict[str, object]]] = []
         self.written: list[str] = []
 
-    async def exec(
-        self, cmd: list[str], **kwargs: object
-    ) -> SimpleNamespace:
+    async def exec(self, cmd: list[str], **kwargs: object) -> SimpleNamespace:
         self.exec_calls.append((cmd, kwargs))
         if cmd == ["/opt/opencode", "--version"]:
             return SimpleNamespace(success=True, stdout="1.18.26\n", stderr="")
@@ -318,9 +314,7 @@ class _NativeConfigPathsSandbox:
     def __init__(self) -> None:
         self.exec_calls: list[list[str]] = []
 
-    async def exec(
-        self, cmd: list[str], **kwargs: object
-    ) -> SimpleNamespace:
+    async def exec(self, cmd: list[str], **kwargs: object) -> SimpleNamespace:
         self.exec_calls.append(cmd)
         if cmd[0] == "git":
             return SimpleNamespace(
@@ -374,11 +368,18 @@ def test_supplied_config_seed_prepares_model_free_startup_without_host_bundle() 
     )
     assert sandbox.exec_calls[0][0] == ["/opt/opencode", "--version"]
     sandbox_commands = [" ".join(call[0]) for call in sandbox.exec_calls]
-    assert any("cp -a --no-preserve=ownership" in command for command in sandbox_commands)
-    assert all("npm " not in command and "opencode run" not in command for command in sandbox_commands)
+    assert any(
+        "cp -a --no-preserve=ownership" in command for command in sandbox_commands
+    )
+    assert all(
+        "npm " not in command and "opencode run" not in command
+        for command in sandbox_commands
+    )
 
 
-def test_missing_config_seed_uses_exact_versioned_host_cache_without_sandbox_npm() -> None:
+def test_missing_config_seed_uses_exact_versioned_host_cache_without_sandbox_npm() -> (
+    None
+):
     """The local companion archive is keyed to the installed CLI version and platform."""
     sandbox = _ConfigDependencySandbox(["empty"])
     create_bundle = Mock(return_value=b"config-dependency-tarball")
@@ -442,7 +443,9 @@ def test_complete_user_dependency_metadata_is_validated_without_copying() -> Non
         )
 
     sandbox_commands = [" ".join(call[0]) for call in sandbox.exec_calls]
-    assert not any("cp -a --no-preserve=ownership" in command for command in sandbox_commands)
+    assert not any(
+        "cp -a --no-preserve=ownership" in command for command in sandbox_commands
+    )
     validate.assert_any_await(
         cast(SandboxEnvironment, sandbox),
         "/node",
@@ -477,9 +480,9 @@ def test_conflicting_complete_user_dependency_metadata_errors_without_copying() 
         )
 
     sandbox_commands = [" ".join(call[0]) for call in sandbox.exec_calls]
-    assert not any("cp -a --no-preserve=ownership" in command for command in sandbox_commands)
-
-
+    assert not any(
+        "cp -a --no-preserve=ownership" in command for command in sandbox_commands
+    )
 
 
 def test_config_dependency_validator_rejects_stale_transitive_package(
@@ -508,12 +511,8 @@ def test_config_dependency_validator_rejects_stale_transitive_package(
 """,
         encoding="utf-8",
     )
-    (plugin_dir / "package.json").write_text(
-        '{"version":"1.18.26"}', encoding="utf-8"
-    )
-    (stale_dir / "package.json").write_text(
-        '{"version":"1.0.0"}', encoding="utf-8"
-    )
+    (plugin_dir / "package.json").write_text('{"version":"1.18.26"}', encoding="utf-8")
+    (stale_dir / "package.json").write_text('{"version":"1.0.0"}', encoding="utf-8")
 
     result = subprocess.run(
         [
@@ -562,9 +561,7 @@ def test_config_dependency_validator_skips_foreign_optional_lock_package(
 """,
         encoding="utf-8",
     )
-    (plugin_dir / "package.json").write_text(
-        '{"version":"1.18.26"}', encoding="utf-8"
-    )
+    (plugin_dir / "package.json").write_text('{"version":"1.18.26"}', encoding="utf-8")
 
     result = subprocess.run(
         [
@@ -612,9 +609,7 @@ def test_config_dependency_validator_rejects_missing_applicable_optional_package
 """,
         encoding="utf-8",
     )
-    (plugin_dir / "package.json").write_text(
-        '{"version":"1.18.26"}', encoding="utf-8"
-    )
+    (plugin_dir / "package.json").write_text('{"version":"1.18.26"}', encoding="utf-8")
 
     result = subprocess.run(
         [
@@ -631,7 +626,9 @@ def test_config_dependency_validator_rejects_missing_applicable_optional_package
     )
 
     assert result.returncode == 1
-    assert "missing installed package metadata for node_modules/linux-x64" in result.stderr
+    assert (
+        "missing installed package metadata for node_modules/linux-x64" in result.stderr
+    )
 
 
 def test_read_only_config_dir_is_left_for_native_opencode() -> None:
@@ -652,7 +649,9 @@ def test_read_only_config_dir_is_left_for_native_opencode() -> None:
 
     sandbox_commands = [" ".join(call[0]) for call in sandbox.exec_calls]
     assert not any("metadata=0" in command for command in sandbox_commands)
-    assert not any("cp -a --no-preserve=ownership" in command for command in sandbox_commands)
+    assert not any(
+        "cp -a --no-preserve=ownership" in command for command in sandbox_commands
+    )
     validate.assert_awaited_once_with(
         cast(SandboxEnvironment, sandbox),
         "/node",
@@ -682,11 +681,13 @@ def test_interrupted_hook_owned_preparation_recovers_on_retry() -> None:
 
     sandbox_commands = [" ".join(call[0]) for call in sandbox.exec_calls]
     assert any(
-        "inspect-swe-opencode-deps-1.18.26.preparing" in command
-        and "rm -f" in command
+        "inspect-swe-opencode-deps-1.18.26.preparing" in command and "rm -f" in command
         for command in sandbox_commands
     )
-    assert any("cp -a --no-preserve=ownership" in command for command in sandbox_commands)
+    assert any(
+        "cp -a --no-preserve=ownership" in command for command in sandbox_commands
+    )
+
 
 def test_partial_user_dependency_metadata_errors_without_copying() -> None:
     """A partial user package tree fails loudly instead of being silently replaced."""
@@ -707,7 +708,9 @@ def test_partial_user_dependency_metadata_errors_without_copying() -> None:
         )
 
     sandbox_commands = [" ".join(call[0]) for call in sandbox.exec_calls]
-    assert not any("cp -a --no-preserve=ownership" in command for command in sandbox_commands)
+    assert not any(
+        "cp -a --no-preserve=ownership" in command for command in sandbox_commands
+    )
 
 
 def test_native_config_dirs_cover_project_home_and_explicit_config_dir() -> None:
@@ -826,9 +829,7 @@ def test_npm_bundle_publishes_cache_atomically(tmp_path: Path) -> None:
             ignore_scripts=True,
         )
 
-    cache_path = (
-        tmp_path / "opencode-config-deps-1.18.26-linux-x64-noscripts.tar.gz"
-    )
+    cache_path = tmp_path / "opencode-config-deps-1.18.26-linux-x64-noscripts.tar.gz"
     replace.assert_called_once()
     assert replace.call_args.args[1] == cache_path
     assert cache_path.read_bytes() == bundle
@@ -836,9 +837,7 @@ def test_npm_bundle_publishes_cache_atomically(tmp_path: Path) -> None:
 
 def test_npm_bundle_rebuilds_an_interrupted_cache_entry(tmp_path: Path) -> None:
     """An unreadable cache artifact is replaced rather than becoming a permanent hit."""
-    cache_path = (
-        tmp_path / "opencode-config-deps-1.18.26-linux-x64-noscripts.tar.gz"
-    )
+    cache_path = tmp_path / "opencode-config-deps-1.18.26-linux-x64-noscripts.tar.gz"
     cache_path.write_bytes(b"interrupted archive")
 
     def fake_npm_install(
