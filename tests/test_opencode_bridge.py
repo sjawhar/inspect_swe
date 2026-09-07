@@ -75,6 +75,8 @@ class _Store:
         "expected_title_agent",
         "with_resolver",
         "expected_bridge_model",
+        "web_search",
+        "expected_web_search",
     ),
     [
         (
@@ -93,6 +95,8 @@ class _Store:
             {"title": {"model": "google/gdm-fsm-plum"}},
             True,
             None,
+            None,
+            True,
         ),
         (
             "google/gdm-fsm-plum",
@@ -110,6 +114,8 @@ class _Store:
             {"title": {"model": "google/gdm-fsm-plum"}},
             False,
             "inspect",
+            False,
+            False,
         ),
         (
             "openai/gpt-5",
@@ -127,6 +133,8 @@ class _Store:
             None,
             True,
             None,
+            None,
+            True,
         ),
     ],
 )
@@ -136,6 +144,8 @@ def test_native_factory_defaults_bare_operator_to_selected_model(
     expected_title_agent: dict[str, dict[str, str]] | None,
     with_resolver: bool,
     expected_bridge_model: str | None,
+    web_search: bool | None,
+    expected_web_search: bool,
 ) -> None:
     module = importlib.import_module("inspect_swe._opencode.opencode")
     state = AgentState(messages=[])
@@ -194,14 +204,22 @@ def test_native_factory_defaults_bare_operator_to_selected_model(
             module, "seed_opencode_config_dependencies", config_dependency_seed
         ),
     ):
-        asyncio.run(
-            module.opencode(
+        if web_search is None:
+            opencode_agent = module.opencode(
                 centaur=CentaurOptions(answer=False),
                 commands_filter=commands_filter,
                 opencode_model=opencode_model,
                 model_resolver=resolver if with_resolver else None,
-            )(state)
-        )
+            )
+        else:
+            opencode_agent = module.opencode(
+                centaur=CentaurOptions(answer=False),
+                commands_filter=commands_filter,
+                opencode_model=opencode_model,
+                model_resolver=resolver if with_resolver else None,
+                web_search=web_search,
+            )
+        asyncio.run(opencode_agent(state))
     config = json.loads(sbox.files["/home/agent/.inspect_swe/opencode/opencode.json"])
     assert sbox.exec_calls[:3] == [
         ["sh", "-c", "echo $HOME"],
@@ -231,6 +249,7 @@ def test_native_factory_defaults_bare_operator_to_selected_model(
     assert bridge_options["model"] == expected_bridge_model
     assert bridge_options["model_resolver"] is (resolver if with_resolver else None)
     assert centaur_call["commands_filter"] is commands_filter
+    assert bridge_options["web_search"] is expected_web_search
     assert config["provider"] == expected_provider
     assert config["model"] == opencode_model
     if expected_title_agent is None:

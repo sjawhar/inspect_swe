@@ -186,6 +186,7 @@ def opencode(
     version: Literal["auto", "sandbox", "stable", "latest"] | str = "auto",
     debug: bool | None = None,
     *,
+    web_search: bool = True,
     commands_filter: CommandsFilter | None = None,
     model_resolver: ModelResolver | None = None,
     accumulate_conversations: bool = False,
@@ -208,6 +209,7 @@ def opencode(
         bridged_tools: Host-side Inspect tools to expose to the agent via MCP
         mcp_ready_timeout: Seconds to wait for bridged MCP endpoints to serve
             tools before the agent launch errors.
+        web_search: Enable the agent's web search tool (defaults to `True`).
         centaur: Run in 'centaur' mode, which makes OpenCode available to an Inspect `human_cli()` agent rather than running it unattended.
         commands_filter: In centaur mode only, filter or augment the human agent's
             command list (e.g. to add task-specific commands). Ignored outside centaur mode.
@@ -284,9 +286,7 @@ def opencode(
             retry_refusals=retry_refusals,
             port=port,
             bridged_tools=bridged_tools,
-            # granted unconditionally to preserve today's behaviour; a grant is
-            # inert unless the CLI declares a native web tool
-            web_search=True,
+            web_search=web_search,
             model_resolver=model_resolver,
             accumulate_conversations=accumulate_conversations,
             model_event_metadata_headers=(
