@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import AsyncIterator
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from inspect_ai.agent import AgentState
 from inspect_swe._util.centaur import CentaurOptions, CentaurSession, CommandsFilter
 
@@ -43,8 +44,46 @@ class _Store:
         assert value == 3001
 
 
-def test_native_google_factory_uses_google_catalog_and_bare_operator_alias() -> None:
-    """Keep the user's `opencode run --model google/...` command unwrapped."""
+@pytest.mark.parametrize(
+    ("opencode_model", "expected_provider", "expected_title_agent"),
+    [
+        (
+            "google/gdm-fsm-plum",
+            {
+                "anthropic": {"options": {"baseURL": "http://localhost:8901/v1"}},
+                "google": {
+                    "npm": "@ai-sdk/google",
+                    "models": {"gdm-fsm-plum": {"name": "gdm-fsm-plum"}},
+                    "options": {
+                        "apiKey": "sk-none",
+                        "baseURL": "http://localhost:8901/v1beta",
+                    },
+                },
+            },
+            {"title": {"model": "google/gdm-fsm-plum"}},
+        ),
+        (
+            "openai/gpt-5",
+            {
+                "anthropic": {"options": {"baseURL": "http://localhost:8901/v1"}},
+                "openai": {"options": {"baseURL": "http://localhost:8901/v1"}},
+                "google": {
+                    "npm": "@ai-sdk/google",
+                    "options": {
+                        "apiKey": "sk-none",
+                        "baseURL": "http://localhost:8901/v1beta",
+                    },
+                },
+            },
+            None,
+        ),
+    ],
+)
+def test_native_factory_configures_selected_and_google_routes_with_bare_operator_alias(
+    opencode_model: str,
+    expected_provider: dict[str, object],
+    expected_title_agent: dict[str, dict[str, str]] | None,
+) -> None:
     module = importlib.import_module("inspect_swe._opencode.opencode")
     state = AgentState(messages=[])
     sbox = _Sandbox()
@@ -97,26 +136,19 @@ def test_native_google_factory_uses_google_catalog_and_bare_operator_alias() -> 
             module.opencode(
                 centaur=CentaurOptions(answer=False),
                 commands_filter=commands_filter,
-                opencode_model="google/gdm-fsm-plum",
+                opencode_model=opencode_model,
                 model_resolver=resolver,
             )(state)
         )
+    config = json.loads(sbox.files["/home/agent/.config/opencode/opencode.json"])
 
     assert bridge_options["model_resolver"] is resolver
     assert centaur_call["commands_filter"] is commands_filter
-    config = json.loads(sbox.files["/home/agent/.config/opencode/opencode.json"])
-    assert config["provider"] == {
-        "anthropic": {"options": {"baseURL": "http://localhost:8901/v1"}},
-        "google": {
-            "npm": "@ai-sdk/google",
-            "models": {"gdm-fsm-plum": {"name": "gdm-fsm-plum"}},
-            "options": {
-                "apiKey": "sk-none",
-                "baseURL": "http://localhost:8901/v1beta",
-            },
-        },
-    }
-    assert config["agent"] == {"title": {"model": "google/gdm-fsm-plum"}}
+    assert config["provider"] == expected_provider
+    if expected_title_agent is None:
+        assert "agent" not in config
+    else:
+        assert config["agent"] == expected_title_agent
     bashrc = centaur_call["bashrc"]
     assert isinstance(bashrc, str)
     assert "alias opencode=/opt/opencode" in bashrc
@@ -127,7 +159,7 @@ def test_native_google_factory_uses_google_catalog_and_bare_operator_alias() -> 
         "/opt/opencode",
         "run",
         "--model",
-        "google/gdm-fsm-plum",
+        opencode_model,
         "--format",
         "json",
     )

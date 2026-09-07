@@ -220,21 +220,21 @@ def opencode(
                 provider_configs[provider_id] = {
                     "options": {"baseURL": f"{bridge_url}/v1"}
                 }
-            google_model_id = (
-                provider_model_id if provider_id == "google" else "gdm-fsm-plum"
-            )
-            if not google_model_id:
-                raise ValueError(
-                    "opencode_model must name a Google model after 'google/'"
-                )
             provider_configs["google"] = {
                 "npm": "@ai-sdk/google",
-                "models": {google_model_id: {"name": google_model_id}},
                 "options": {
                     "apiKey": "sk-none",
                     "baseURL": f"{bridge_url}/v1beta",
                 },
             }
+            if provider_id == "google":
+                if not provider_model_id:
+                    raise ValueError(
+                        "opencode_model must name a Google model after 'google/'"
+                    )
+                provider_configs["google"]["models"] = {
+                    provider_model_id: {"name": provider_model_id}
+                }
             opencode_config: dict[str, Any] = {
                 "$schema": "https://opencode.ai/config.json",
                 "provider": provider_configs,
