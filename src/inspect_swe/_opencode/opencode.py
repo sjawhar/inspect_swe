@@ -152,10 +152,10 @@ def opencode(
 
     # determine which provider client opencode will use, so we know which
     # provider entry's baseURL to override in the config (the bridge intercepts
-    # the request regardless of which provider protocol opencode picks).
-    provider_id = (
-        opencode_model.split("/", 1)[0] if "/" in opencode_model else "anthropic"
-    )
+    provider_id, separator, provider_model_id = opencode_model.partition("/")
+    if not separator:
+        provider_id = "anthropic"
+        provider_model_id = opencode_model
 
     async def execute(state: AgentState) -> AgentState:
         # determine port (use new port for each execution of agent on sample)
@@ -204,24 +204,38 @@ def opencode(
             home_result = await sbox.exec(["sh", "-c", "echo $HOME"], user=user)
             sandbox_home = home_result.stdout.strip() or "/root"
 
-            # write opencode config to redirect provider baseURL to the bridge
+            # write opencode config to redirect provider requests to the bridge
             # and (optionally) configure mcp servers.
             #
             # The bridge's model-proxy server registers OpenAI-compatible
             # routes (/v1/responses, /v1/chat/completions), the Anthropic
             # Messages route (/v1/messages), and Gemini routes
-            # (/v1beta/models/*, /models/*). The AI SDK provider clients
-            # append the API-relative path (e.g. "/messages",
-            # "/chat/completions") to the configured baseURL, so we must
-            # include "/v1" in the baseURL we hand to opencode.
+            # (/v1beta/models/*, /models/*). Each provider client appends its
+            # API-relative path to its configured baseURL.
             bridge_url = f"http://localhost:{bridge.port}"
-            provider_base_url = f"{bridge_url}/v1"
+            provider_configs: dict[str, Any] = {
+                "anthropic": {"options": {"baseURL": f"{bridge_url}/v1"}}
+            }
+            if provider_id == "google":
+                if not provider_model_id:
+                    raise ValueError("opencode_model must name a Google model after 'google/'")
+                provider_configs["google"] = {
+                    "npm": "@ai-sdk/google",
+                    "models": {provider_model_id: {"name": provider_model_id}},
+                    "options": {
+                        "apiKey": "sk-none",
+                        "baseURL": f"{bridge_url}/v1beta",
+                    },
+                }
             opencode_config: dict[str, Any] = {
                 "$schema": "https://opencode.ai/config.json",
-                "provider": {
-                    provider_id: {"options": {"baseURL": provider_base_url}},
-                },
+                "provider": provider_configs,
             }
+            if provider_id == "google":
+                # OpenCode's hidden title agent otherwise falls back to the
+                # provider's advertised small model. Route that automatic
+                # auxiliary request through the caller's selected bridge target.
+                opencode_config["agent"] = {"title": {"model": opencode_model}}
             if resolved_skills is not None:
                 opencode_config["permission"] = {"skill": {"*": "allow"}}
             if all_mcp_servers:
@@ -293,6 +307,7 @@ def opencode(
                 "OPENAI_BASE_URL": f"{bridge_url}/v1",
                 "ANTHROPIC_API_KEY": "sk-none",
                 "OPENAI_API_KEY": "sk-none",
+                "GOOGLE_GENERATIVE_AI_API_KEY": "sk-none",
                 "OPENCODE_CONFIG": opencode_config_path,
                 "PATH": path,
                 "HOME": sandbox_home,
@@ -484,8 +499,7 @@ async def _run_opencode_centaur(
     # not HOME which would break human_cli (PATH is needed for node)
     centaur_env = {k: v for k, v in agent_env.items() if k != "HOME"}
     agent_env_vars = [f'export {k}="{v}"' for k, v in centaur_env.items()]
-    alias_cmd = shlex.join(opencode_cmd)
-    alias_cmd = "alias opencode='" + alias_cmd.replace("'", "'\\''") + "'"
+    alias_cmd = "alias opencode=" + shlex.quote(opencode_cmd[0])
     bashrc = "\n".join(
         agent_env_vars + ["", alias_cmd, f"cd -- {shlex.quote(session.cwd)}"]
     )
