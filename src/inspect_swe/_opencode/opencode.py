@@ -24,6 +24,7 @@ from inspect_ai.model import (
 from inspect_ai.scorer import score
 from inspect_ai.tool import MCPServerConfig, Skill, install_skills, read_skills
 from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
+from inspect_ai.util import SandboxEnvironment
 from inspect_ai.util import sandbox as sandbox_env
 from inspect_ai.util import store
 from inspect_ai.util._sandbox import ExecRemoteAwaitableOptions
@@ -50,13 +51,88 @@ from ._events.plugin import (
     AppendOnlyCompactionLog,
     compaction_plugin_spec,
 )
-from .agentbinary import ensure_opencode_setup
+from .agentbinary import ensure_opencode_setup, seed_opencode_config_dependencies
 
 
 def _event_identity(event: ModelEvent) -> OpenCodeRequestIdentity | None:
     metadata = event.metadata or {}
     headers = metadata.get(BRIDGE_REQUEST_HEADERS)
     return request_identity(headers) if isinstance(headers, dict) else None
+
+
+async def _native_opencode_config_dirs(
+    sandbox: SandboxEnvironment,
+    agent_cwd: str,
+    global_config_dir: str,
+    native_home: str,
+    config_dir: str | None,
+    project_config_disabled: bool,
+    user: str | None,
+) -> list[str]:
+    """Match OpenCode ConfigPaths.directories before Config.load reaches npm."""
+    directories = [global_config_dir]
+    if not project_config_disabled:
+        worktree_result = await sandbox.exec(
+            ["git", "-C", agent_cwd, "rev-parse", "--show-toplevel"], user=user
+        )
+        worktree = (
+            worktree_result.stdout.strip()
+            if worktree_result.success and worktree_result.stdout.strip().startswith("/")
+            else "/"
+        )
+        project_result = await sandbox.exec(
+            [
+                "bash",
+                "-c",
+                dedent("""
+                    current="$1"
+                    stop="$2"
+                    while true; do
+                      candidate="$current/.opencode"
+                      [ -e "$candidate" ] && printf '%s\n' "$candidate"
+                      [ "$current" = "$stop" ] && break
+                      parent="$(dirname "$current")"
+                      [ "$parent" = "$current" ] && break
+                      current="$parent"
+                    done
+                """),
+                "opencode-config-paths",
+                agent_cwd,
+                worktree,
+            ],
+            user=user,
+        )
+        if not project_result.success:
+            raise RuntimeError(
+                "Unable to discover native OpenCode project config directories: "
+                f"{project_result.stderr}"
+            )
+        directories.extend(
+            directory
+            for directory in project_result.stdout.splitlines()
+            if directory.startswith("/")
+        )
+
+    home_config_dir = f"{native_home}/.opencode"
+    home_result = await sandbox.exec(
+        [
+            "bash",
+            "-c",
+            '[ -e "$1" ] && printf "%s\\n" "$1"; exit 0',
+            "opencode-config-home",
+            home_config_dir,
+        ],
+        user=user,
+    )
+    if not home_result.success:
+        raise RuntimeError(
+            "Unable to discover the native OpenCode home config directory: "
+            f"{home_result.stderr}"
+        )
+    directories.extend(home_result.stdout.splitlines())
+    if config_dir:
+        directories.append(config_dir)
+    return list(dict.fromkeys(directories))
 
 
 @agent
@@ -89,6 +165,7 @@ def opencode(
     commands_filter: CommandsFilter | None = None,
     model_resolver: ModelResolver | None = None,
     accumulate_conversations: bool = False,
+    config_dependency_seed: str | None = None,
 ) -> Agent:
     """OpenCode agent.
 
@@ -136,6 +213,9 @@ def opencode(
             - "stable"/"latest": Download and use the latest version
             - "x.x.x": Download and use a specific version
         debug: Trace all debug output.
+        config_dependency_seed: Absolute sandbox directory with the exact CLI
+            version's OpenCode config dependency package metadata and production
+            node_modules. When omitted, provision an equivalent host-cached seed.
     """
     # resolve centaur
     if centaur is True:
@@ -204,6 +284,14 @@ def opencode(
             home_result = await sbox.exec(["sh", "-c", "echo $HOME"], user=user)
             sandbox_home = home_result.stdout.strip() or "/root"
 
+            launch_env = env or {}
+            effective_home = launch_env.get("HOME", sandbox_home)
+            native_home = launch_env.get("OPENCODE_TEST_HOME", effective_home)
+            xdg_config_home = launch_env.get(
+                "XDG_CONFIG_HOME", f"{effective_home}/.config"
+            )
+            opencode_config_dir = f"{xdg_config_home}/opencode"
+
             # write opencode config to redirect provider requests to the bridge
             # and (optionally) configure mcp servers.
             #
@@ -250,7 +338,6 @@ def opencode(
             if all_mcp_servers:
                 opencode_config["mcp"] = resolve_mcp_servers(all_mcp_servers)
 
-            opencode_config_dir = f"{sandbox_home}/.config/opencode"
             opencode_config_path = f"{opencode_config_dir}/opencode.json"
             plugin_path = f"{opencode_config_dir}/inspect_swe_compaction.mjs"
             event_log_path = f"{opencode_config_dir}/inspect_swe_events.jsonl"
@@ -265,6 +352,26 @@ def opencode(
                     resolved_skills, sbox, user, f"{opencode_config_dir}/skills"
                 )
             await sbox.write_file(opencode_config_path, json.dumps(opencode_config))
+
+            native_config_dirs = await _native_opencode_config_dirs(
+                sbox,
+                agent_cwd,
+                opencode_config_dir,
+                native_home,
+                launch_env.get("OPENCODE_CONFIG_DIR"),
+                launch_env.get("OPENCODE_DISABLE_PROJECT_CONFIG", "").lower()
+                in {"true", "1"},
+                user,
+            )
+            await seed_opencode_config_dependencies(
+                sbox,
+                opencode_binary,
+                f"{dependency_bin_dirs[0]}/node",
+                dependency_bin_dirs,
+                native_config_dirs,
+                config_dependency_seed,
+                user,
+            )
 
             event_log = AppendOnlyCompactionLog()
 

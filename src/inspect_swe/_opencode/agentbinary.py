@@ -1,8 +1,10 @@
 import json
+import re
+import shlex
 from pathlib import Path
 from typing import Any
 
-from inspect_ai.util import SandboxEnvironment
+from inspect_ai.util import SandboxEnvironment, concurrency
 from typing_extensions import Literal
 
 from .._util.agentbinary import (
@@ -12,9 +14,14 @@ from .._util.agentbinary import (
 )
 from .._util.appdirs import package_cache_dir
 from .._util.download import download_text_file
-from .._util.node import ensure_node_available
+from .._util.node import create_npm_bundle, ensure_node_available
 from .._util.ripgrep import ensure_ripgrep_available
-from .._util.sandbox import SandboxPlatform, detect_sandbox_platform
+from .._util.sandbox import (
+    SANDBOX_INSTALL_DIR,
+    SandboxPlatform,
+    bash_command,
+    detect_sandbox_platform,
+)
 
 
 async def ensure_opencode_setup(
@@ -162,3 +169,222 @@ async def _fetch_release_assets(version: str) -> dict[str, Any]:
     release_json = await download_text_file(release_url)
     result: dict[str, Any] = json.loads(release_json)
     return result
+
+
+_CONFIG_DEPENDENCY_PACKAGE = "@opencode-ai/plugin"
+_CONFIG_DEPENDENCY_CACHE_NAME = "opencode-config-deps"
+
+_CONFIG_DEPENDENCY_VALIDATION = r"""
+const fs = require("node:fs");
+const path = require("node:path");
+const [directory, expectedVersion] = process.argv.slice(1);
+
+function fail(message) {
+  console.error(message);
+  process.exit(1);
+}
+
+function readJson(relativePath) {
+  const file = path.join(directory, relativePath);
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (error) {
+    fail(`unable to read ${file}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+const packageJson = readJson("package.json");
+const packageLock = readJson("package-lock.json");
+const root = packageLock.packages && packageLock.packages[""];
+if (!root || !root.dependencies) fail("package-lock.json has no root production dependencies");
+if (packageJson.dependencies?.["@opencode-ai/plugin"] !== expectedVersion) {
+  fail(`package.json does not pin @opencode-ai/plugin@${expectedVersion}`);
+}
+if (root.dependencies["@opencode-ai/plugin"] !== expectedVersion) {
+  fail(`package-lock.json does not pin @opencode-ai/plugin@${expectedVersion}`);
+}
+const plugin = readJson("node_modules/@opencode-ai/plugin/package.json");
+if (plugin.version !== expectedVersion) {
+  fail(`installed @opencode-ai/plugin is ${plugin.version}, expected ${expectedVersion}`);
+}
+const packagePaths = Object.keys(packageLock.packages || {}).filter((entry) =>
+  entry.startsWith("node_modules/"),
+);
+if (packagePaths.length === 0) fail("package-lock.json has no installed production closure");
+for (const packagePath of packagePaths) {
+  if (!fs.existsSync(path.join(directory, packagePath, "package.json"))) {
+    fail(`missing installed package metadata for ${packagePath}`);
+  }
+}
+"""
+
+
+async def seed_opencode_config_dependencies(
+    sandbox: SandboxEnvironment,
+    opencode_binary: str,
+    node_binary: str,
+    dependency_bin_dirs: list[str],
+    config_dirs: list[str],
+    config_dependency_seed: str | None,
+    user: str | None,
+) -> None:
+    """Seed every native OpenCode config directory before CLI initialization."""
+    cli_version = await _opencode_cli_version(
+        sandbox, opencode_binary, dependency_bin_dirs, user
+    )
+    if config_dependency_seed is not None:
+        if not config_dependency_seed.startswith("/"):
+            raise ValueError(
+                "config_dependency_seed must be an absolute sandbox directory"
+            )
+        seed_dir = config_dependency_seed
+    else:
+        platform = await detect_sandbox_platform(sandbox)
+        seed_dir = await _local_config_dependency_seed(
+            sandbox, cli_version, platform, user
+        )
+
+    await _validate_config_dependency_tree(
+        sandbox, node_binary, seed_dir, cli_version, user
+    )
+    for config_dir in dict.fromkeys(config_dirs):
+        state = await _config_dependency_state(sandbox, config_dir, user)
+        if state == "partial":
+            raise RuntimeError(
+                "OpenCode config directory "
+                f"{config_dir!r} has incomplete dependency metadata; refusing "
+                "to overwrite it"
+            )
+        if state == "complete":
+            await _validate_config_dependency_tree(
+                sandbox, node_binary, config_dir, cli_version, user
+            )
+            continue
+
+        quoted_source = shlex.quote(seed_dir)
+        quoted_target = shlex.quote(config_dir)
+        result = await sandbox.exec(
+            bash_command(
+                f"mkdir -p {quoted_target} && "
+                f"cp -a --no-preserve=ownership "
+                f"{quoted_source}/package.json "
+                f"{quoted_source}/package-lock.json "
+                f"{quoted_source}/node_modules {quoted_target}/"
+            ),
+            user=user,
+        )
+        if not result.success:
+            raise RuntimeError(
+                f"Unable to seed OpenCode config dependencies in {config_dir!r}: "
+                f"{result.stderr}"
+            )
+        await _validate_config_dependency_tree(
+            sandbox, node_binary, config_dir, cli_version, user
+        )
+
+
+async def _opencode_cli_version(
+    sandbox: SandboxEnvironment,
+    opencode_binary: str,
+    dependency_bin_dirs: list[str],
+    user: str | None,
+) -> str:
+    path = ":".join([*dependency_bin_dirs, "/usr/local/bin", "/usr/bin", "/bin"])
+    result = await sandbox.exec(
+        [opencode_binary, "--version"], env={"PATH": path}, user=user
+    )
+    if not result.success:
+        raise RuntimeError(
+            "Unable to determine the OpenCode CLI version before provisioning "
+            f"its config dependencies: {result.stderr}"
+        )
+    match = re.fullmatch(r"v?(\d+\.\d+\.\d+)", result.stdout.strip())
+    if match is None:
+        raise RuntimeError(
+            "Unable to parse OpenCode CLI version before provisioning config "
+            f"dependencies: {result.stdout.strip()!r}"
+        )
+    return match.group(1)
+
+
+async def _local_config_dependency_seed(
+    sandbox: SandboxEnvironment,
+    cli_version: str,
+    platform: SandboxPlatform,
+    user: str | None,
+) -> str:
+    seed_dir = f"{SANDBOX_INSTALL_DIR}/opencode-config-deps-{cli_version}-{platform}"
+    async with concurrency(
+        f"opencode-config-deps-{cli_version}-{platform}", 1, visible=False
+    ):
+        bundle_data = create_npm_bundle(
+            package=_CONFIG_DEPENDENCY_PACKAGE,
+            version=cli_version,
+            platform=platform,
+            cache_name=_CONFIG_DEPENDENCY_CACHE_NAME,
+            ignore_scripts=True,
+        )
+        archive_path = f"{seed_dir}.tar.gz"
+        await sandbox.write_file(archive_path, bundle_data)
+        result = await sandbox.exec(
+            bash_command(
+                f"mkdir -p {shlex.quote(seed_dir)} && "
+                f"tar -xzf {shlex.quote(archive_path)} -C {shlex.quote(seed_dir)} && "
+                f"rm -f {shlex.quote(archive_path)}"
+            ),
+            user="root",
+        )
+        if not result.success:
+            raise RuntimeError(
+                "Unable to extract the local OpenCode config dependency seed: "
+                f"{result.stderr}"
+            )
+    return seed_dir
+
+
+async def _config_dependency_state(
+    sandbox: SandboxEnvironment, config_dir: str, user: str | None
+) -> Literal["empty", "complete", "partial"]:
+    quoted_dir = shlex.quote(config_dir)
+    result = await sandbox.exec(
+        bash_command(
+            f"mkdir -p {quoted_dir}; "
+            f"metadata=0; "
+            f"[ -e {quoted_dir}/package.json ] && metadata=$((metadata + 1)); "
+            f"[ -e {quoted_dir}/package-lock.json ] && metadata=$((metadata + 1)); "
+            f"[ -e {quoted_dir}/node_modules ] && metadata=$((metadata + 1)); "
+            f"if [ \"$metadata\" -eq 0 ]; then echo empty; "
+            f"elif [ \"$metadata\" -eq 3 ]; then echo complete; "
+            f"else echo partial; fi"
+        ),
+        user=user,
+    )
+    state = result.stdout.strip()
+    if not result.success or state not in {"empty", "complete", "partial"}:
+        raise RuntimeError(
+            f"Unable to inspect OpenCode dependency metadata in {config_dir!r}: "
+            f"{result.stderr}"
+        )
+    if state == "empty":
+        return "empty"
+    if state == "complete":
+        return "complete"
+    return "partial"
+
+
+async def _validate_config_dependency_tree(
+    sandbox: SandboxEnvironment,
+    node_binary: str,
+    directory: str,
+    cli_version: str,
+    user: str | None,
+) -> None:
+    result = await sandbox.exec(
+        [node_binary, "-e", _CONFIG_DEPENDENCY_VALIDATION, directory, cli_version],
+        user=user,
+    )
+    if not result.success:
+        raise RuntimeError(
+            "OpenCode config dependency seed is incompatible with the running "
+            f"CLI {cli_version} at {directory!r}: {result.stderr.strip()}"
+        )
