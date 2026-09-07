@@ -14,6 +14,7 @@ from inspect_ai.agent import (
     sandbox_agent_bridge,
 )
 from inspect_ai.model import (
+    ChatMessage,
     ChatMessageSystem,
     GenerateFilter,
     Model,
@@ -248,7 +249,10 @@ def claude_code(
         retry_refusals: Should refusals be retried? Defaults to retrying up to 3 times.
         retry_uncaught_errors: Should uncaught errors (unexpected crashes of Claude Code) be retried. Defaults to retrying up to 3 times.
         cwd: Working directory to run claude code within.
-        env: Environment variables to set for claude code.
+        env: Environment variables to set for claude code. Applied last, so
+            they override the sandbox defaults inspect_swe sets (see
+            `_claude_code/env.py`); e.g. `CLAUDE_CODE_DISABLE_AUTO_MEMORY="0"`
+            re-enables auto-memory.
         user: User to execute claude code with.
         sandbox: Optional sandbox environment name.
         version: Version of claude code to use. One of:
@@ -489,7 +493,13 @@ def claude_code(
             # advance. The unattended path below still pins its own `claude -p`,
             # because it is the only party that ever resumes that session.
             if centaur:
-                invocation = [claude_binary, *cmd]
+                invocation = _centaur_claude_cmd(
+                    claude_binary,
+                    cmd,
+                    state.messages,
+                    system_prompt,
+                    replace_system_prompt,
+                )
                 try:
                     return await run_claude_code_centaur(
                         options=centaur,
@@ -531,15 +541,8 @@ def claude_code(
                         # resume. Appended messages are not re-sent because the bridge
                         # round-trips them into state.messages and appending them again
                         # would duplicate the effective prompt.
-                        system_texts = [
-                            m.text
-                            for m in state.messages
-                            if isinstance(m, ChatMessageSystem)
-                        ]
-                        if system_prompt is not None:
-                            system_texts.append(system_prompt)
                         system_args = _system_prompt_args(
-                            system_texts,
+                            _system_texts(state.messages, system_prompt),
                             replace_system_prompt,
                             is_resume=is_resume,
                         )
@@ -709,6 +712,50 @@ def claude_code(
 
     # return agent with specified name and descritpion
     return agent_with(execute, name=name, description=description)
+
+
+def _system_texts(
+    messages: Sequence[ChatMessage], system_prompt: str | None
+) -> list[str]:
+    """System texts to append: the task's own, then the caller's.
+
+    Shared by the centaur and unattended launches so the operator's `claude`
+    alias and the unattended agent cannot disagree about the effective prompt.
+    """
+    texts = [m.text for m in messages if isinstance(m, ChatMessageSystem)]
+    if system_prompt is not None:
+        texts.append(system_prompt)
+    return texts
+
+
+def _centaur_claude_cmd(
+    claude_binary: str,
+    cmd: Sequence[str],
+    messages: Sequence[ChatMessage],
+    system_prompt: str | None,
+    replace_system_prompt: str | None,
+) -> list[str]:
+    """The `claude` invocation aliased into the operator's centaur shell.
+
+    Carries the SAME system prompt the unattended launch builds. Without the
+    prompt args here, `system_prompt` and `replace_system_prompt` are silently
+    dropped in centaur mode: the human's session runs with Claude Code's stock
+    prompt while the caller has every reason to believe the one it passed is in
+    effect.
+
+    `is_resume=False` because the alias always starts a fresh session --
+    `claude --resume` is the operator's own call, and re-sending an append there
+    would duplicate the effective prompt.
+    """
+    return (
+        [claude_binary]
+        + list(cmd)
+        + _system_prompt_args(
+            _system_texts(messages, system_prompt),
+            replace_system_prompt,
+            is_resume=False,
+        )
+    )
 
 
 def _system_prompt_args(

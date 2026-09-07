@@ -1,7 +1,7 @@
 import sys
 from argparse import Namespace
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import AbstractAsyncContextManager
+from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import dataclass
 from logging import getLogger
 from typing import Literal
@@ -9,7 +9,7 @@ from typing import Literal
 from inspect_ai.agent import AgentState, human_cli, run
 from inspect_ai.agent._human.commands.command import HumanAgentCommand
 from inspect_ai.agent._human.state import HumanAgentState
-from inspect_ai.util import SandboxEnvironment
+from inspect_ai.util import SandboxEnvironment, sandbox_default
 from pydantic import BaseModel, Field, JsonValue
 
 logger = getLogger(__name__)
@@ -44,6 +44,7 @@ class CentaurSession:
     session_id: str | None
     refresh: CentaurRefresh | None = None
     finalize: CentaurFinalize | None = None
+    sandbox_name: str | None = None
 
 
 CentaurReady = Callable[[CentaurSession], AbstractAsyncContextManager[None]]
@@ -87,46 +88,52 @@ async def run_centaur(
     if session.refresh is not None:
         commands_filter = _commands_filter_with_refresh(commands_filter, session)
 
-    if commands_filter is not None:
-        agent = human_cli(
-            answer=options.answer,
-            intermediate_scoring=options.intermediate_scoring,
-            record_session=options.record_session,
-            instructions=instructions,
-            bashrc=bashrc,
-            user=session.user,
-            commands_filter=commands_filter,
-            on_ready=on_ready,
-        )
-    else:
-        agent = human_cli(
-            answer=options.answer,
-            intermediate_scoring=options.intermediate_scoring,
-            record_session=options.record_session,
-            instructions=instructions,
-            bashrc=bashrc,
-            user=session.user,
-            on_ready=on_ready,
-        )
-
-    try:
-        completed_state = await run(agent, session.state)
-        # human_cli returns a copy whose only current mutation is its answer. The
-        # bridge state has the native model conversation, so retain its messages.
-        session.state.output = completed_state.output
-    except BaseException:
-        try:
-            await _finalize_centaur_session(session)
-        except BaseException as error:
-            logger.warning(
-                "Centaur recorder finalization failed while preserving the "
-                "original session exception",
-                exc_info=error,
+    sandbox_scope = (
+        sandbox_default(session.sandbox_name)
+        if session.sandbox_name is not None
+        else nullcontext()
+    )
+    with sandbox_scope:
+        if commands_filter is not None:
+            agent = human_cli(
+                answer=options.answer,
+                intermediate_scoring=options.intermediate_scoring,
+                record_session=options.record_session,
+                instructions=instructions,
+                bashrc=bashrc,
+                user=session.user,
+                commands_filter=commands_filter,
+                on_ready=on_ready,
             )
-        raise
-    else:
-        await _finalize_centaur_session(session)
-        return session.state
+        else:
+            agent = human_cli(
+                answer=options.answer,
+                intermediate_scoring=options.intermediate_scoring,
+                record_session=options.record_session,
+                instructions=instructions,
+                bashrc=bashrc,
+                user=session.user,
+                on_ready=on_ready,
+            )
+
+        try:
+            completed_state = await run(agent, session.state)
+            # human_cli returns a copy whose only current mutation is its answer. The
+            # bridge state has the native model conversation, so retain its messages.
+            session.state.output = completed_state.output
+        except BaseException:
+            try:
+                await _finalize_centaur_session(session)
+            except BaseException as error:
+                logger.warning(
+                    "Centaur recorder finalization failed while preserving the "
+                    "original session exception",
+                    exc_info=error,
+                )
+            raise
+        else:
+            await _finalize_centaur_session(session)
+            return session.state
 
 
 async def _finalize_centaur_session(session: CentaurSession) -> None:

@@ -17,6 +17,7 @@ import pytest
 from inspect_swe._claude_code.env import (
     BLOCKING_MCP_ENV,
     FALSY_ENV_VALUES,
+    TRUTHY_ENV_VALUES,
     claude_code_agent_env,
 )
 from inspect_swe._claude_code.model import resolve_claude_code_models
@@ -105,3 +106,32 @@ def test_dynamic_model_resolution_rejects_static_model_environment() -> None:
             models=None,
             env={"ANTHROPIC_MODEL": "claude-sonnet-4-5"},
         )
+
+
+def test_auto_memory_is_disabled_by_default() -> None:
+    """See ``DISABLE_AUTO_MEMORY_ENV`` for why a sandboxed agent wants this off."""
+    value = _env()["CLAUDE_CODE_DISABLE_AUTO_MEMORY"]
+    # Claude Code reads this with a truthy check: only these tokens disable.
+    # Asserting membership (not just presence) catches a regression to a value
+    # like "false" that would silently re-enable auto-memory.
+    assert value in TRUTHY_ENV_VALUES, (
+        f"CLAUDE_CODE_DISABLE_AUTO_MEMORY={value!r} does not disable "
+        f"auto-memory; it must be one of {sorted(TRUTHY_ENV_VALUES)}"
+    )
+
+
+def test_caller_can_re_enable_auto_memory() -> None:
+    """Escape hatch for tasks that deliberately study memory persistence.
+
+    Claude Code treats an explicit falsy token as "enabled" (overriding even
+    ``settings.json``), so a caller opts back in with ``"0"``.
+    """
+    env = _env(CLAUDE_CODE_DISABLE_AUTO_MEMORY="0")
+    assert env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "0"
+
+
+def test_acp_claude_code_disables_auto_memory_too() -> None:
+    """The ACP adapter builds its own env; keep it from drifting."""
+    from inspect_swe.acp._agents.claude_code.claude_code import _BRIDGE_SAFE_ENV
+
+    assert _BRIDGE_SAFE_ENV["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] in TRUTHY_ENV_VALUES

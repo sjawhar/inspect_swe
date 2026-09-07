@@ -254,36 +254,41 @@ def test_codex_cli_accepts_auto_review_with_transparent_proxy() -> None:
     codex_cli(auto_review=True, transparent_proxy=True)
 
 
-def test_transparent_proxy_binds_guardian_without_explicit_model() -> None:
-    # reproduces the review finding on #100: with auto_review enabled but no
-    # explicit CodexAutoReview(model=...), codex's guardian request (hardcoded
-    # to GUARDIAN_MODEL_SLUG regardless of configuration) must still resolve
-    # to the real target model rather than raising or falling through to some
-    # other model -- this is exactly what codex_cli()'s execute() computes
-    # for the bridge's model_aliases under transparent_proxy=True.
-    real_model = get_model("mockllm/model")
+def test_transparent_proxy_leaves_guardian_slug_unaliased() -> None:
+    # With auto_review enabled but no explicit CodexAutoReview(model=...),
+    # transparent_proxy must NOT bind codex's hardcoded guardian slug to the
+    # session model: that redirect is the agent reviewing itself. The slug is
+    # left for the bridge to resolve from the request, exactly like any other
+    # name codex sends.
     aliases = resolve_codex_auto_review_model_aliases(
-        resolve_codex_auto_review(True), None, default=real_model
+        resolve_codex_auto_review(True), None
     )
-    resolved = resolve_inspect_model(GUARDIAN_MODEL_SLUG, aliases, None)
-    assert resolved is real_model
+    assert aliases is None
 
 
-def test_transparent_proxy_keeps_main_line_fallback() -> None:
-    # the review also found that codex's own --model slug (a bare, unprefixed
-    # catalog slug like "gpt-5.1-codex") can't resolve as a raw model name --
-    # get_model() requires "<api_name>/<model_name>". codex_cli()'s execute()
-    # keeps passing the bridge sentinel as the fallback under
-    # transparent_proxy=True precisely so this ordinary request still
-    # resolves, the same as when transparent_proxy=False.
-    model = "mockllm/model"
-    real_model = get_model(model)
-    bridge_model = f"inspect/{model}"  # mirrors codex_cli()'s own bridge_model
+def test_transparent_proxy_without_fallback_sends_bare_names_to_the_bridge() -> None:
+    # codex_cli()'s execute() passes model=None under transparent_proxy=True, so
+    # neither codex's own --model slug nor the guardian slug is redirected to
+    # the session model. On a bridge that cannot resolve a bare name (no
+    # endpoint-provider inference) both requests fail loudly here rather than
+    # silently landing on the wrong model -- which is why transparent_proxy is
+    # opt-in and its docstring names that bridge requirement.
     aliases = resolve_codex_auto_review_model_aliases(
-        resolve_codex_auto_review(True), None, default=real_model
+        resolve_codex_auto_review(True), None
     )
-    resolved = resolve_inspect_model("gpt-5.1-codex", aliases, bridge_model)
-    assert resolved.name == real_model.name
+    for slug in (GUARDIAN_MODEL_SLUG, "gpt-5.1-codex"):
+        with pytest.raises(ValueError, match="<api_name>/<model_name>"):
+            resolve_inspect_model(slug, aliases, None)
+
+
+def test_explicit_guardian_model_still_binds_under_transparent_proxy() -> None:
+    # An explicit CodexAutoReview(model=...) is a deliberate routing choice and
+    # survives transparent_proxy: the alias table is kept, only the fallback goes.
+    guardian = get_model("mockllm/model")
+    aliases = resolve_codex_auto_review_model_aliases(
+        CodexAutoReview(model=guardian), None
+    )
+    assert resolve_inspect_model(GUARDIAN_MODEL_SLUG, aliases, None) is guardian
 
 
 def test_interactive_codex_cli_accepts_auto_review(

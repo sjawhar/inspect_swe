@@ -11,7 +11,7 @@ from inspect_swe import (
     download_agent_binary,
     download_wheels_tarball,
 )
-from inspect_swe._util.download import download_file
+from inspect_swe._util.download import _request_headers, download_file
 
 
 @pytest.mark.slow
@@ -74,6 +74,30 @@ def test_cached_agent_binaries_lists_opencode(tmp_path: Path) -> None:
         cached = cached_agent_binaries("opencode")
 
     assert [(b.agent, b.version) for b in cached] == [("opencode", "1.14.30")]
+
+
+def test_cached_agent_binaries_lists_antigravity_cli(tmp_path: Path) -> None:
+    from inspect_swe._antigravity_cli import agentbinary as antigravity_agentbinary
+
+    with patch.object(
+        antigravity_agentbinary, "package_cache_dir", return_value=tmp_path
+    ):
+        source = antigravity_agentbinary.antigravity_cli_binary_source()
+        for version in ("1.1.20", "1.1.27"):
+            source.cached_binary_path(version, "linux-x64").write_bytes(b"binary")
+
+        default_cached = cached_agent_binaries("antigravity_cli")
+        cached = cached_agent_binaries("antigravity_cli", quiet=True)
+
+    assert [(binary.agent, binary.version) for binary in cached] == [
+        ("antigravity_cli", "1.1.27"),
+        ("antigravity_cli", "1.1.20"),
+    ]
+    assert {binary.path.name for binary in cached} == {
+        "agy-1.1.27-linux-x64",
+        "agy-1.1.20-linux-x64",
+    }
+    assert cached == default_cached
 
 
 @pytest.mark.slow
@@ -332,3 +356,51 @@ def test_ensure_pip_available_raises_on_failure() -> None:
             _ensure_pip_available()
 
         assert "ensurepip disabled" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("token_var", ["GITHUB_TOKEN", "GH_TOKEN"])
+def test_github_api_requests_authenticate_when_a_token_is_present(
+    monkeypatch: pytest.MonkeyPatch, token_var: str
+) -> None:
+    """Release-asset lookups must send a token when one is available.
+
+    Unauthenticated GitHub REST is 60 requests/hour per source IP; shared CI runners
+    exhaust that between them, and the eval then fails resolving an agent binary that
+    has nothing to do with the task under test.
+    """
+    for var in ("GITHUB_TOKEN", "GH_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv(token_var, "sentinel-token")
+
+    assert _request_headers(
+        "https://api.github.com/repos/openai/codex/releases/tags/rust-v0.153.1"
+    ) == {"Authorization": "Bearer sentinel-token"}
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        pytest.param("https://objects.githubusercontent.com/asset", id="github-cdn"),
+        pytest.param("https://code.kimi.com/latest.json", id="third-party-cdn"),
+        pytest.param("https://storage.googleapis.com/bucket/x", id="gcs"),
+        pytest.param("https://api.github.com.evil.test/repos/x", id="suffix-lookalike"),
+    ],
+)
+def test_no_token_is_sent_to_hosts_other_than_the_github_api(
+    monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    """The token authenticates one metadata API, not every download.
+
+    The asset CDNs need no credential, and the lookalike case is why the host is
+    compared exactly rather than by suffix.
+    """
+    monkeypatch.setenv("GITHUB_TOKEN", "sentinel-token")
+    assert _request_headers(url) == {}
+
+
+def test_github_api_requests_are_anonymous_without_a_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for var in ("GITHUB_TOKEN", "GH_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    assert _request_headers("https://api.github.com/repos/openai/codex") == {}
