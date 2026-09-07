@@ -1,12 +1,13 @@
 """Tests for the OpenCode agent install/setup utilities."""
 
+import importlib
+
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, Mock, patch
 
 import anyio
-import inspect_swe._opencode.opencode as opencode_module
 import pytest
 from inspect_ai import Task, eval
 from inspect_ai.dataset import Sample
@@ -334,7 +335,7 @@ def test_supplied_config_seed_prepares_model_free_startup_without_host_bundle() 
             "agent",
         )
 
-    validate.assert_any_awaited_with(
+    validate.assert_any_await(
         cast(SandboxEnvironment, sandbox),
         "/node",
         "/opt/agent-cli/opencode/etc/opencode/config-deps",
@@ -404,7 +405,7 @@ def test_complete_user_dependency_metadata_is_validated_without_copying() -> Non
 
     sandbox_commands = [" ".join(call[0]) for call in sandbox.exec_calls]
     assert not any("cp -a --no-preserve=ownership" in command for command in sandbox_commands)
-    validate.assert_any_awaited_with(
+    validate.assert_any_await(
         cast(SandboxEnvironment, sandbox),
         "/node",
         "/home/agent/.opencode",
@@ -467,8 +468,9 @@ def test_native_config_dirs_cover_project_home_and_explicit_config_dir() -> None
     """Every ConfigPaths location is provisioned, not only the wrapper global config."""
     sandbox = _NativeConfigPathsSandbox()
 
+    module = importlib.import_module("inspect_swe._opencode.opencode")
     directories = anyio.run(
-        opencode_module._native_opencode_config_dirs,
+        module._native_opencode_config_dirs,
         cast(SandboxEnvironment, sandbox),
         "/worktree/src/deep",
         "/home/agent/.config/opencode",
@@ -490,9 +492,9 @@ def test_native_config_dirs_cover_project_home_and_explicit_config_dir() -> None
 def test_native_config_dirs_respect_project_config_disable_flag() -> None:
     """The native disable flag leaves global, home, and explicit dirs intact."""
     sandbox = _NativeConfigPathsSandbox()
-
+    module = importlib.import_module("inspect_swe._opencode.opencode")
     directories = anyio.run(
-        opencode_module._native_opencode_config_dirs,
+        module._native_opencode_config_dirs,
         cast(SandboxEnvironment, sandbox),
         "/worktree/src/deep",
         "/home/agent/.config/opencode",
