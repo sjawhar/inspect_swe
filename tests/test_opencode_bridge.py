@@ -20,17 +20,35 @@ from inspect_swe._util.centaur import (
 
 class _ExecResult:
     def __init__(self, stdout: str = "") -> None:
+        self.success = True
+        self.stderr = ""
         self.stdout = stdout
 
 
 class _Sandbox:
     def __init__(self) -> None:
+        self.exec_calls: list[list[str]] = []
         self.files: dict[str, str] = {}
 
     async def exec(self, cmd: list[str], *, user: str | None) -> _ExecResult:
         assert user is None
+        self.exec_calls.append(cmd)
         if cmd == ["sh", "-c", "echo $HOME"]:
             return _ExecResult("/home/agent\n")
+        if cmd == ["git", "-C", "/workspace", "rev-parse", "--show-toplevel"]:
+            return _ExecResult("/workspace\n")
+        if (
+            len(cmd) >= 4
+            and cmd[:2] == ["bash", "-c"]
+            and cmd[3] == "opencode-config-paths"
+        ):
+            return _ExecResult()
+        if (
+            len(cmd) >= 4
+            and cmd[:2] == ["bash", "-c"]
+            and cmd[3] == "opencode-config-home"
+        ):
+            return _ExecResult()
         assert cmd == ["mkdir", "-p", "/home/agent/.inspect_swe/opencode"]
         return _ExecResult()
 
@@ -94,6 +112,7 @@ def test_native_factory_defaults_bare_operator_to_selected_model(
     bridge = SimpleNamespace(port=8901, mcp_server_configs=[], state=state)
     bridge_options: dict[str, object] = {}
     centaur_call: dict[str, object] = {}
+    config_dependency_seed = AsyncMock()
 
     def resolver(_requested: str) -> None:
         return None
@@ -140,6 +159,9 @@ def test_native_factory_defaults_bare_operator_to_selected_model(
         patch.object(module, "sandbox_agent_bridge", bridge_context),
         patch.object(module, "build_user_prompt", return_value=("write files", False)),
         patch.object(module, "run_centaur", capture_centaur),
+        patch.object(
+            module, "seed_opencode_config_dependencies", config_dependency_seed
+        ),
     ):
         asyncio.run(
             module.opencode(
@@ -150,6 +172,30 @@ def test_native_factory_defaults_bare_operator_to_selected_model(
             )(state)
         )
     config = json.loads(sbox.files["/home/agent/.inspect_swe/opencode/opencode.json"])
+    assert sbox.exec_calls[:3] == [
+        ["sh", "-c", "echo $HOME"],
+        ["mkdir", "-p", "/home/agent/.inspect_swe/opencode"],
+        ["git", "-C", "/workspace", "rev-parse", "--show-toplevel"],
+    ]
+    assert len(sbox.exec_calls) == 5
+    assert sbox.exec_calls[3][3:] == [
+        "opencode-config-paths",
+        "/workspace",
+        "/workspace",
+    ]
+    assert sbox.exec_calls[4][3:] == [
+        "opencode-config-home",
+        "/home/agent/.opencode",
+    ]
+    config_dependency_seed.assert_awaited_once_with(
+        sbox,
+        "/opt/opencode",
+        "/opt/node/bin/node",
+        ["/opt/node/bin", "/opt/rg"],
+        ["/home/agent/.config/opencode"],
+        None,
+        None,
+    )
 
     assert bridge_options["model_resolver"] is resolver
     assert centaur_call["commands_filter"] is commands_filter

@@ -2,6 +2,7 @@
 
 import importlib
 import os
+import shutil
 import subprocess
 
 from pathlib import Path
@@ -813,9 +814,9 @@ def test_npm_bundle_publishes_cache_atomically(tmp_path: Path) -> None:
     replace = Mock(wraps=os.replace)
     with (
         patch.object(node_util, "package_cache_dir", return_value=tmp_path),
-        patch.object(node_util.shutil, "which", return_value="/usr/bin/npm"),
-        patch.object(node_util.subprocess, "run", fake_npm_install),
-        patch.object(node_util.os, "replace", replace),
+        patch.object(shutil, "which", return_value="/usr/bin/npm"),
+        patch.object(subprocess, "run", fake_npm_install),
+        patch.object(os, "replace", replace),
     ):
         bundle = node_util.create_npm_bundle(
             package="@opencode-ai/plugin",
@@ -855,8 +856,8 @@ def test_npm_bundle_rebuilds_an_interrupted_cache_entry(tmp_path: Path) -> None:
 
     with (
         patch.object(node_util, "package_cache_dir", return_value=tmp_path),
-        patch.object(node_util.shutil, "which", return_value="/usr/bin/npm"),
-        patch.object(node_util.subprocess, "run", fake_npm_install),
+        patch.object(shutil, "which", return_value="/usr/bin/npm"),
+        patch.object(subprocess, "run", fake_npm_install),
     ):
         bundle = node_util.create_npm_bundle(
             package="@opencode-ai/plugin",
