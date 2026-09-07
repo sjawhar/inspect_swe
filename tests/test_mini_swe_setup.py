@@ -18,6 +18,13 @@ from inspect_swe._mini_swe_agent.setup import (
 from tests.conftest import skip_if_no_docker
 
 
+def test_mini_swe_agent_factory_uses_its_documented_default_version() -> None:
+    """The public factory validates and forwards its stable default version."""
+    from inspect_swe._mini_swe_agent.mini_swe_agent import mini_swe_agent
+
+    assert mini_swe_agent() is not None
+
+
 @pytest.mark.parametrize(
     "version", ["stable", "sandbox", "latest", "2.0.0", "2.2.3", "3.0.0"]
 )

@@ -49,34 +49,60 @@ BLOCKING_MCP_ENV: Final = {
     "MCP_CONNECT_TIMEOUT_MS": "300000",
 }
 
+MODEL_IDENTITY_ENV: Final = frozenset(
+    {
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
+    }
+)
+
 
 def claude_code_agent_env(
     *,
     bridge_port: int,
-    models: ClaudeCodeModels,
+    models: ClaudeCodeModels | None,
     env: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Environment for the Claude Code subprocess.
 
     Args:
         bridge_port: Port of the in-sandbox bridge the agent's API calls go to.
-        models: Resolved presented identities (cosmetic; the bridge routes to
-            the real model).
+        models: Resolved cosmetic identities. Omit only for a dynamic native
+            model resolver, which must not set any static model environment.
         env: Caller overrides, applied last so any default here can be
             replaced -- including the MCP startup defaults.
 
     Returns:
         The merged environment, caller values winning on conflict.
     """
+    if models is None:
+        static_model_env = sorted(MODEL_IDENTITY_ENV.intersection(env or {}))
+        if static_model_env:
+            raise ValueError(
+                "Dynamic model resolution cannot combine with static Claude model "
+                f"environment variables: {', '.join(static_model_env)}."
+            )
+
+    model_env = (
+        {}
+        if models is None
+        else {
+            "ANTHROPIC_MODEL": models.presented,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": models.opus,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": models.sonnet,
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": models.haiku,
+            "CLAUDE_CODE_SUBAGENT_MODEL": models.subagent,
+            "ANTHROPIC_SMALL_FAST_MODEL": models.haiku,
+        }
+    )
     return {
         "ANTHROPIC_BASE_URL": f"http://localhost:{bridge_port}",
         "ANTHROPIC_AUTH_TOKEN": "sk-ant-api03-DOq5tyLPrk9M4hPE",
-        "ANTHROPIC_MODEL": models.presented,
-        "ANTHROPIC_DEFAULT_OPUS_MODEL": models.opus,
-        "ANTHROPIC_DEFAULT_SONNET_MODEL": models.sonnet,
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL": models.haiku,
-        "CLAUDE_CODE_SUBAGENT_MODEL": models.subagent,
-        "ANTHROPIC_SMALL_FAST_MODEL": models.haiku,
+        **model_env,
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
         "IS_SANDBOX": "1",

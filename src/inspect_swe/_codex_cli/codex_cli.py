@@ -20,6 +20,7 @@ from inspect_ai.model import (
     GenerateFilter,
     Model,
     ModelName,
+    ModelResolver,
     get_model,
 )
 from inspect_ai.scorer import score
@@ -36,7 +37,13 @@ from inspect_ai.util._sandbox import ExecRemoteAwaitableOptions
 from typing_extensions import Unpack
 
 from inspect_swe._util._async import is_callable_coroutine
-from inspect_swe._util.centaur import CentaurOptions, run_centaur
+from inspect_swe._util.centaur import (
+    CentaurOptions,
+    CentaurSession,
+    CommandsFilter,
+    reset_recorder_preserving_session_exception,
+    run_centaur,
+)
 from inspect_swe._util.mcp_ready import (
     DEFAULT_MCP_READY_TIMEOUT,
     wait_for_mcp_endpoints,
@@ -122,6 +129,10 @@ def codex_cli(
     approval_policy: CodexApprovalPolicy = "never",
     network_access: bool = True,
     approve_static_mcp_tools: bool = False,
+    *,
+    commands_filter: CommandsFilter | None = None,
+    model_resolver: ModelResolver | None = None,
+    accumulate_conversations: bool = False,
     **deprecated_args: Unpack[CodexDeprecatedArgs],
 ) -> Agent:
     """Codex CLI.
@@ -163,6 +174,13 @@ def codex_cli(
             Pass `CodexAutoReview` to customize the guardian policy and model.
             Requires Codex CLI >= 0.137.0. Defaults to `False`.
         centaur: Run in 'centaur' mode, which makes Codex CLI available to an Inspect `human_cli()` agent rather than running it unattended.
+        commands_filter: In centaur mode only, filter or augment the human agent's
+            command list (e.g. to add task-specific commands). Ignored outside centaur mode.
+        model_resolver: Dynamic bridge routing policy called after `model_aliases`
+            and before the fallback `model`. Return a model/spec to route, or
+            `None` to defer.
+        accumulate_conversations: Keep every bridge conversation in
+            `state.messages` rather than only the main agent loop.
         attempts: Configure agent to make multiple attempts. When this is specified, the task will be scored when the agent stops calling tools. If the scoring is successful, execution will stop. Otherwise, the agent will be prompted to pick up where it left off for another attempt.
         model: Model name to use (defaults to main model for task).
         model_aliases: Optional mapping of model names to Model instances or model name strings.
@@ -385,6 +403,8 @@ def codex_cli(
                 web_search=effective_web_search != "disabled",
                 model_event_sink=consumer,
                 checkpointer=cp,
+                model_resolver=model_resolver,
+                accumulate_conversations=accumulate_conversations,
             ) as bridge,
         ):
             if cp.attempt == "resume_for_scoring":
@@ -659,13 +679,26 @@ def codex_cli(
                 )
 
             if centaur:
-                await _run_codex_cli_centaur(
-                    options=centaur,
-                    codex_cmd=cmd,
-                    image_files=image_files,
-                    agent_env=agent_env,
-                    state=state,
-                )
+                try:
+                    return await _run_codex_cli_centaur(
+                        options=centaur,
+                        codex_cmd=cmd,
+                        image_files=image_files,
+                        agent_env=agent_env,
+                        session=CentaurSession(
+                            state=bridge.state,
+                            invocation=tuple(cmd),
+                            environment=agent_env,
+                            cwd=agent_cwd,
+                            user=user,
+                            sandbox=sbox,
+                            bridge_port=bridge.port,
+                            session_id=None,
+                        ),
+                        commands_filter=commands_filter,
+                    )
+                finally:
+                    reset_recorder_preserving_session_exception(consumer.reset)
             else:
                 # execute the agent (track debug output)
                 debug_output: list[str] = []
@@ -874,8 +907,9 @@ async def _run_codex_cli_centaur(
     codex_cmd: list[str],
     image_files: list[str],
     agent_env: dict[str, str],
-    state: AgentState,
-) -> None:
+    session: CentaurSession,
+    commands_filter: CommandsFilter | None = None,
+) -> AgentState:
     instructions = "Codex CLI:\n\n - You may also use Codex CLI via the 'codex' command.\n - Use 'codex resume' if you need to resume a previous codex session."
 
     if image_files:
@@ -913,12 +947,16 @@ async def _run_codex_cli_centaur(
         alias_cmd = shlex.join(codex_cmd)
         codex_cmd_def = "alias codex='" + alias_cmd.replace("'", "'\\''") + "'"
 
-    # build .bashrc content
+    # human_cli installs this profile for session.user; login shells retain the
+    # wrapper's exact working directory as well as its bridge environment.
     agent_env_vars = [f'export {k}="{v}"' for k, v in agent_env.items()]
-    bashrc = "\n".join(agent_env_vars + ["", codex_cmd_def])
+    bashrc = "\n".join(
+        agent_env_vars + ["", codex_cmd_def, f"cd -- {shlex.quote(session.cwd)}"]
+    )
 
-    # run the human cli
-    await run_centaur(options, instructions, bashrc, state)
+    return await run_centaur(
+        options, instructions, bashrc, session, commands_filter=commands_filter
+    )
 
 
 async def _last_rollout(

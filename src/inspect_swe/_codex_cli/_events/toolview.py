@@ -19,8 +19,8 @@ def tool_view(
     arguments: dict[str, Any],
     nicknames: Mapping[str, str] | None = None,
 ) -> ToolCallContent | None:
-    # wait_agent renders agent ids → nicknames, so it needs the consumer's
-    # thread_id → nickname map (the others are a pure function of arguments).
+    # wait_agent renders native keys → nicknames, so it needs the consumer's
+    # native-key → nickname map (the others are pure functions of arguments).
     if tool == WAIT_AGENT:
         return _wait_agent_view(arguments, nicknames or {})
     view = _tool_views.get(tool)

@@ -13,7 +13,14 @@ from inspect_ai.agent import (
     agent_with,
     sandbox_agent_bridge,
 )
-from inspect_ai.model import ChatMessageSystem, GenerateFilter, Model
+from inspect_ai.event import ModelEvent
+from inspect_ai.model import (
+    BRIDGE_REQUEST_HEADERS,
+    ChatMessageSystem,
+    GenerateFilter,
+    Model,
+    ModelResolver,
+)
 from inspect_ai.scorer import score
 from inspect_ai.tool import MCPServerConfig, Skill, install_skills, read_skills
 from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
@@ -22,7 +29,12 @@ from inspect_ai.util import store
 from inspect_ai.util._sandbox import ExecRemoteAwaitableOptions
 
 from inspect_swe._util._async import is_callable_coroutine
-from inspect_swe._util.centaur import CentaurOptions, run_centaur
+from inspect_swe._util.centaur import (
+    CentaurOptions,
+    CentaurSession,
+    CommandsFilter,
+    run_centaur,
+)
 from inspect_swe._util.mcp_ready import (
     DEFAULT_MCP_READY_TIMEOUT,
     wait_for_mcp_endpoints,
@@ -31,7 +43,20 @@ from inspect_swe._util.messages import build_user_prompt
 from inspect_swe._util.sandbox import resolve_agent_cwd
 from inspect_swe._util.trace import trace
 
+from ._events.consumer import OpenCodeConsumer
+from ._events.identity import OpenCodeRequestIdentity, request_identity
+from ._events.plugin import (
+    OPENCODE_COMPACTION_PLUGIN,
+    AppendOnlyCompactionLog,
+    compaction_plugin_spec,
+)
 from .agentbinary import ensure_opencode_setup
+
+
+def _event_identity(event: ModelEvent) -> OpenCodeRequestIdentity | None:
+    metadata = event.metadata or {}
+    headers = metadata.get(BRIDGE_REQUEST_HEADERS)
+    return request_identity(headers) if isinstance(headers, dict) else None
 
 
 @agent
@@ -60,6 +85,10 @@ def opencode(
     sandbox: str | None = None,
     version: Literal["auto", "sandbox", "stable", "latest"] | str = "auto",
     debug: bool | None = None,
+    *,
+    commands_filter: CommandsFilter | None = None,
+    model_resolver: ModelResolver | None = None,
+    accumulate_conversations: bool = False,
 ) -> Agent:
     """OpenCode agent.
 
@@ -79,6 +108,13 @@ def opencode(
         mcp_ready_timeout: Seconds to wait for bridged MCP endpoints to serve
             tools before the agent launch errors.
         centaur: Run in 'centaur' mode, which makes OpenCode available to an Inspect `human_cli()` agent rather than running it unattended.
+        commands_filter: In centaur mode only, filter or augment the human agent's
+            command list (e.g. to add task-specific commands). Ignored outside centaur mode.
+        model_resolver: Dynamic bridge routing policy called after `model_aliases`
+            and before the fallback `model`. Return a model/spec to route, or
+            `None` to defer.
+        accumulate_conversations: Keep every bridge conversation in
+            `state.messages` rather than only the main agent loop.
         attempts: Configure agent to make multiple attempts
         model: Model name to use for inspect bridge (defaults to main model for task)
         model_aliases: Optional mapping of model names to Model instances or model name strings.
@@ -127,6 +163,8 @@ def opencode(
         port = store().get(MODEL_PORT, 3000) + 1
         store().set(MODEL_PORT, port)
 
+        consumer = OpenCodeConsumer(_event_identity)
+
         async with sandbox_agent_bridge(
             state,
             model=model,
@@ -139,6 +177,14 @@ def opencode(
             # granted unconditionally to preserve today's behaviour; a grant is
             # inert unless the CLI declares a native web tool
             web_search=True,
+            model_resolver=model_resolver,
+            accumulate_conversations=accumulate_conversations,
+            model_event_metadata_headers=(
+                "x-opencode-session",
+                "x-session-id",
+                "x-parent-session-id",
+            ),
+            model_event_sink=consumer,
         ) as bridge:
             # resolve sandbox
             sbox = sandbox_env(sandbox)
@@ -183,12 +229,26 @@ def opencode(
 
             opencode_config_dir = f"{sandbox_home}/.config/opencode"
             opencode_config_path = f"{opencode_config_dir}/opencode.json"
+            plugin_path = f"{opencode_config_dir}/inspect_swe_compaction.mjs"
+            event_log_path = f"{opencode_config_dir}/inspect_swe_events.jsonl"
             await sbox.exec(["mkdir", "-p", opencode_config_dir], user=user)
+            await sbox.write_file(plugin_path, OPENCODE_COMPACTION_PLUGIN)
+            await sbox.write_file(event_log_path, "")
+            opencode_config["plugin"] = [
+                compaction_plugin_spec(plugin_path, event_log_path)
+            ]
             if resolved_skills is not None:
                 await install_skills(
                     resolved_skills, sbox, user, f"{opencode_config_dir}/skills"
                 )
             await sbox.write_file(opencode_config_path, json.dumps(opencode_config))
+
+            event_log = AppendOnlyCompactionLog()
+
+            async def refresh(_command: str) -> None:
+                payload = await sbox.read_file(event_log_path, text=True)
+                for native_event in event_log.drain(payload):
+                    consumer.on_native_event(native_event)
 
             # build system prompt (opencode run takes a single positional message
             # and has no separate --system-prompt flag, so we prepend)
@@ -258,12 +318,26 @@ def opencode(
                 )
 
             if centaur:
-                await _run_opencode_centaur(
-                    options=centaur,
-                    opencode_cmd=cmd,
-                    agent_env=agent_env,
-                    state=state,
-                )
+                try:
+                    return await _run_opencode_centaur(
+                        options=centaur,
+                        opencode_cmd=cmd,
+                        agent_env=agent_env,
+                        session=CentaurSession(
+                            state=bridge.state,
+                            invocation=tuple(cmd),
+                            environment=agent_env,
+                            cwd=agent_cwd,
+                            user=user,
+                            sandbox=sbox,
+                            bridge_port=bridge.port,
+                            session_id=None,
+                            refresh=refresh,
+                        ),
+                        commands_filter=commands_filter,
+                    )
+                finally:
+                    consumer.reset()
             else:
                 debug_output: list[str] = []
                 agent_prompt = prompt
@@ -304,6 +378,7 @@ def opencode(
                         ),
                         stream=False,
                     )
+                    await refresh("opencode execution")
 
                     if debug:
                         debug_output.append(result.stdout)
@@ -340,6 +415,7 @@ def opencode(
                     debug_output.insert(0, "OpenCode Debug Output:")
                     trace("\n".join(debug_output))
 
+        consumer.reset()
         return bridge.state
 
     return agent_with(execute, name=name, description=description)
@@ -395,8 +471,9 @@ async def _run_opencode_centaur(
     options: CentaurOptions,
     opencode_cmd: list[str],
     agent_env: dict[str, str],
-    state: AgentState,
-) -> None:
+    session: CentaurSession,
+    commands_filter: CommandsFilter | None = None,
+) -> AgentState:
     instructions = (
         "OpenCode:\n\n"
         " - You may also use OpenCode via the 'opencode' command.\n"
@@ -409,6 +486,10 @@ async def _run_opencode_centaur(
     agent_env_vars = [f'export {k}="{v}"' for k, v in centaur_env.items()]
     alias_cmd = shlex.join(opencode_cmd)
     alias_cmd = "alias opencode='" + alias_cmd.replace("'", "'\\''") + "'"
-    bashrc = "\n".join(agent_env_vars + ["", alias_cmd])
+    bashrc = "\n".join(
+        agent_env_vars + ["", alias_cmd, f"cd -- {shlex.quote(session.cwd)}"]
+    )
 
-    await run_centaur(options, instructions, bashrc, state)
+    return await run_centaur(
+        options, instructions, bashrc, session, commands_filter=commands_filter
+    )

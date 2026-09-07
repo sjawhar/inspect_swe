@@ -28,6 +28,7 @@ from inspect_ai.model import (
     GenerateInput,
     Model,
     ModelOutput,
+    ModelResolver,
     get_model_info,
 )
 from inspect_ai.scorer import score
@@ -46,7 +47,12 @@ from inspect_ai.util import store
 from inspect_ai.util._sandbox import ExecRemoteAwaitableOptions
 
 from inspect_swe._util._async import is_callable_coroutine
-from inspect_swe._util.centaur import CentaurOptions, run_centaur
+from inspect_swe._util.centaur import (
+    CentaurOptions,
+    CentaurSession,
+    CommandsFilter,
+    run_centaur,
+)
 from inspect_swe._util.mcp_ready import (
     DEFAULT_MCP_READY_TIMEOUT,
     wait_for_mcp_endpoints,
@@ -130,6 +136,10 @@ def kimi_code(
     sandbox: str | None = None,
     version: Literal["auto", "sandbox", "stable", "latest"] | str = "auto",
     debug: bool = False,
+    *,
+    commands_filter: CommandsFilter | None = None,
+    model_resolver: ModelResolver | None = None,
+    accumulate_conversations: bool = False,
 ) -> Agent:
     """Kimi Code agent.
 
@@ -154,6 +164,13 @@ def kimi_code(
         mcp_ready_timeout: Seconds to wait for bridged MCP endpoints to serve
             tools before the agent launch errors.
         centaur: Run in 'centaur' mode, which makes Kimi Code available to an Inspect `human_cli()` agent rather than running it unattended.
+        commands_filter: In centaur mode only, filter or augment the human agent's
+            command list (e.g. to add task-specific commands). Ignored outside centaur mode.
+        model_resolver: Dynamic bridge routing policy called after `model_aliases`
+            and before the fallback `model`. Return a model/spec to route, or
+            `None` to defer.
+        accumulate_conversations: Keep every bridge conversation in
+            `state.messages` rather than only the main agent loop.
         attempts: Configure agent to make multiple attempts
         model: Model name to use for inspect bridge (defaults to main model for task)
         max_context_size: Context window to configure for Kimi. Defaults to the
@@ -242,6 +259,8 @@ def kimi_code(
             # granted unconditionally to preserve today's behaviour; a grant is
             # inert unless the CLI declares a native web tool
             web_search=True,
+            model_resolver=model_resolver,
+            accumulate_conversations=accumulate_conversations,
         ) as bridge:
             # resolve sandbox
             sbox = sandbox_env(sandbox)
@@ -324,11 +343,21 @@ def kimi_code(
                 )
 
             if centaur:
-                await _run_kimi_code_centaur(
+                return await _run_kimi_code_centaur(
                     options=centaur,
                     kimi_cmd=cmd,
                     agent_env=agent_env,
-                    state=state,
+                    session=CentaurSession(
+                        state=bridge.state,
+                        invocation=tuple(cmd),
+                        environment=agent_env,
+                        cwd=agent_cwd,
+                        user=user,
+                        sandbox=sbox,
+                        bridge_port=bridge.port,
+                        session_id=None,
+                    ),
+                    commands_filter=commands_filter,
                 )
             else:
                 debug_output: list[str] = []
@@ -595,8 +624,9 @@ async def _run_kimi_code_centaur(
     options: CentaurOptions,
     kimi_cmd: list[str],
     agent_env: dict[str, str],
-    state: AgentState,
-) -> None:
+    session: CentaurSession,
+    commands_filter: CommandsFilter | None = None,
+) -> AgentState:
     instructions = (
         "Kimi Code:\n\n"
         " - You may also use Kimi Code via the 'kimi' command.\n"
@@ -608,6 +638,10 @@ async def _run_kimi_code_centaur(
     agent_env_vars = [f'export {k}="{v}"' for k, v in centaur_env.items()]
     alias_cmd = shlex.join(kimi_cmd)
     alias_cmd = "alias kimi='" + alias_cmd.replace("'", "'\\''") + "'"
-    bashrc = "\n".join(agent_env_vars + ["", alias_cmd])
+    bashrc = "\n".join(
+        agent_env_vars + ["", alias_cmd, f"cd -- {shlex.quote(session.cwd)}"]
+    )
 
-    await run_centaur(options, instructions, bashrc, state)
+    return await run_centaur(
+        options, instructions, bashrc, session, commands_filter=commands_filter
+    )

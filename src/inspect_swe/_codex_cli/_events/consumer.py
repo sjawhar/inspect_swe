@@ -1,69 +1,39 @@
-"""Bridge `ModelEventSink` for Codex CLI sub-agent spans (bridge-only).
+"""Bridge `ModelEventSink` for Codex CLI sub-agent spans.
 
-Installed on the agent bridge so the bridge hands us every `ModelEvent` for
-routing instead of emitting it to the transcript itself. From those events alone
-(no Codex `--json` stdout parsing) we reconstruct the agent-span tree:
+The sink opens spans from a parent's native `spawn_agent` tool call and binds
+the result's exact native routing key to that tool-call ID. V1 returns an
+`agent_id`; v2 returns a slash-prefixed `task_name`, which the bridge preserves
+as the raw `agent_message` recipient on the child `ModelEvent`. A child event
+whose native recipient arrives before its root receives the matching result is
+held until that exact result binds it to one open span.
 
-  1. **Open** (race-free) — when a parent's output contains `spawn_agent`
-     tool-calls, `on_complete` opens an agent `SpanBeginEvent` for each, keyed by
-     the spawn tool-call id, and registers the spawn prompt for attribution. This
-     happens synchronously before the bridge response is returned, so the spans
-     are open before any sub-agent can make its first call.
+When a root request carries the bridge's exact native Codex thread identity,
+the consumer keeps it in the outer span even while a child is live. Root
+identity takes precedence over recipient routing, and ambiguous or unresolved
+child bootstrap records fail rather than guessing from history or being
+silently emitted unscoped.
 
-  2. **Attribute** — `on_pending` resolves each call's span by substring-matching
-     its user-message text against the open spawn prompts. Codex re-sends a
-     sub-agent's spawn prompt as a user message on every request, so this works
-     for every call (not just the first). Zero/multiple matches → outer span.
-
-  3. **Bind thread id** — the `spawn_agent` tool *result* carries the sub-agent's
-     `agent_id` (thread id), correlated to the spawn call by `tool_call_id`. We
-     harvest it from `event.input` so spans can be closed by thread id.
-
-  4. **Close** — on a `close_agent` tool-call (`target=thread_id`) and on any
-     `status:completed` notification for a thread id (whichever comes first).
-     `reset()` closes orphans between attempts and at the end.
-
-Compaction: our custom bridge provider forces Codex's *local* compaction, a
-normal `/v1/responses` call carrying `COMPACTION_MARKER`. We detect it in
-`on_pending` and emit a `CompactionEvent` on the attributed span.
-
-Concurrency: attribution is per-request (keyed on the call's own prompt, not
-wall-clock state), so parallel sub-agents are handled correctly — each call
-routes to its own span regardless of interleaving, and each thread binds/closes
-independently via its unique spawn `tool_call_id`.
+Codex's bridge-local compaction marker is emitted as a `CompactionEvent`.
 """
 
 from dataclasses import dataclass
-from logging import getLogger
 
 from inspect_ai.event import CompactionEvent, SpanBeginEvent, SpanEndEvent
 from inspect_ai.event._model import ModelEvent
 from inspect_ai.log import transcript
-from inspect_ai.model._chat_message import (
-    ChatMessage,
-    ChatMessageTool,
-    ChatMessageUser,
-)
+from inspect_ai.model._chat_message import ChatMessage, ChatMessageTool
 from inspect_ai.model._model import ModelEventSink
 from inspect_ai.util._span import current_span_id
 
 from .detection import (
     agent_message_recipients,
-    completed_thread_ids,
-    final_answer_authors,
+    completed_agent_keys,
     find_close_targets,
     find_spawned_agents,
     is_compaction_request,
     spawn_result,
 )
 from .toolview import tool_view
-
-logger = getLogger(__name__)
-
-
-# Minimum spawn-prompt length to consider for substring matching, guarding
-# against short prompts accidentally matching unrelated content.
-_MIN_PROMPT_LENGTH = 16
 
 
 @dataclass
@@ -72,9 +42,15 @@ class _OpenAgent:
 
     call_id: str
     span_id: str
-    prompt: str
-    name: str = "agent"
-    thread_id: str | None = None
+    native_key: str | None = None
+
+
+@dataclass
+class _PendingChildEvent:
+    """A child event awaiting an exact native spawn-result binding."""
+
+    event: ModelEvent
+    recipients: set[str]
 
 
 class CodexConsumer(ModelEventSink):
@@ -82,12 +58,28 @@ class CodexConsumer(ModelEventSink):
         # spawn tool_call_id → open sub-agent span. Insertion order = open order
         # (used to close innermost-first in reset()).
         self._agents: dict[str, _OpenAgent] = {}
+        # native routing key → all spawn tool-call IDs that returned it. A
+        # duplicate key is ambiguous and must never select a child span.
+        self._agent_key_index: dict[str, set[str]] = {}
 
-        # thread_id → spawn tool_call_id (bound when the spawn result is seen).
-        self._thread_index: dict[str, str] = {}
+        # Pinned Codex 0.153.1 `spawn_agent_internal()` sends the initial
+        # inter-agent communication before it returns the `LiveAgent` whose
+        # result supplies this recipient, so this ordering is native.
+        # Preserve the event until that result identifies one open child span.
+        self._pending_child_events: list[_PendingChildEvent] = []
 
-        # thread_id → nickname (Codex's friendly per-agent name, for tool views).
+        # A held event may complete before the parent receives the result that
+        # gives it a span. Delay its completion processing so any descendants
+        # inherit the correct child span after the exact binding arrives.
+        self._completed_pending_events: set[int] = set()
+
+        # native routing key → nickname (Codex's friendly per-agent name).
         self._nicknames: dict[str, str] = {}
+
+        # Root Codex Responses thread. The bridge projects it from native
+        # client_metadata, so a root continuation remains distinguishable while
+        # a child span is live.
+        self._root_thread_id: str | None = None
 
         # ModelEvents we've _event()'d, so on_complete knows to _event_updated.
         self._emitted_events: set[int] = set()
@@ -106,46 +98,83 @@ class CodexConsumer(ModelEventSink):
         """Close any open spans and clear per-attempt state.
 
         Called between Codex attempts and after the attempt loop, so the span
-        tree stays balanced even if Codex exited before closing a sub-agent.
+        tree stays balanced even if Codex exited before a child binds.
         """
+        self._flush_pending_child_events()
+        unresolved_recipients = sorted(
+            {
+                recipient
+                for pending in self._pending_child_events
+                for recipient in pending.recipients
+            }
+        )
+
         for call_id in reversed(list(self._agents.keys())):
             agent = self._agents.pop(call_id)
             transcript()._event(SpanEndEvent(id=agent.span_id))
-        self._thread_index.clear()
+        self._agent_key_index.clear()
+        self._pending_child_events.clear()
         self._nicknames.clear()
         self._emitted_events.clear()
+        self._completed_pending_events.clear()
+        self._root_thread_id = None
+
+        if unresolved_recipients:
+            raise RuntimeError(
+                "Codex child events were not bound to an exact native "
+                f"spawn result: {', '.join(unresolved_recipients)}."
+            )
 
     # ------------------------------------------------------------------
     # ModelEventSink callbacks (called from the bridge)
     # ------------------------------------------------------------------
 
     def on_pending(self, event: ModelEvent) -> None:
-        # bind thread ids from any spawn results, then close completed threads
-        # (V1: wait/close status dicts; V2: FINAL_ANSWER agent_messages)
+        # A root's native thread ID wins over child routing even while a child
+        # is open. Bind any earlier child bootstrap records first because a
+        # root receives the spawn result after the child can start.
         self._harvest_bindings(event.input)
-        for thread_id in completed_thread_ids(event.input):
-            self._close_thread(thread_id)
-        for author in final_answer_authors(event.input):
-            self._close_thread(author)
+        self._flush_pending_child_events()
+        completed_keys = completed_agent_keys(event.input)
+        for native_key in completed_keys:
+            self._close_agent_key(native_key)
 
-        # attribute this call to a span
-        span_id = self._attribute(event.input)
-        event.span_id = span_id
+        root_thread_id = _root_thread_id(event.metadata)
+        if root_thread_id is not None:
+            if self._root_thread_id is None:
+                self._root_thread_id = root_thread_id
+            if root_thread_id == self._root_thread_id:
+                event.span_id = self.outer_span_id
+                self._emit_event(event)
+                return
 
-        # compaction summarization call → emit a marker on the same span
-        if is_compaction_request(event.input):
-            transcript()._event(
-                CompactionEvent(
-                    source="codex_cli",
-                    span_id=span_id,
-                    metadata={"trigger": "auto"},
-                )
+        recipients = agent_message_recipients(event.input)
+        span_id = self._child_span_for_recipients(recipients)
+        if span_id is not None:
+            event.span_id = span_id
+            self._emit_event(event)
+            return
+        if recipients and self._agents and not completed_keys:
+            self._pending_child_events.append(
+                _PendingChildEvent(event=event, recipients=recipients)
             )
+            self._flush_pending_child_events()
+            return
 
-        self._emitted_events.add(id(event))
-        transcript()._event(event)
+        event.span_id = None if self._agents else self.outer_span_id
+        self._emit_event(event)
 
     def on_complete(self, event: ModelEvent) -> None:
+        if any(pending.event is event for pending in self._pending_child_events):
+            self._completed_pending_events.add(id(event))
+            return
+        self._complete_event(event)
+
+    # ------------------------------------------------------------------
+    # internal
+    # ------------------------------------------------------------------
+
+    def _complete_event(self, event: ModelEvent) -> None:
         msg = event.output.message if event.output else None
         if msg is not None and msg.tool_calls:
             # custom rendering for Codex built-in tools (see toolview.py)
@@ -155,9 +184,9 @@ class CodexConsumer(ModelEventSink):
                     if custom is not None:
                         tc.view = custom
 
-            # open a span for each spawned sub-agent — synchronously, before the
-            # bridge response is returned, so the span is ready before the
-            # sub-agent's first call arrives.
+            # Open each child before its first call can arrive. A buffered
+            # parent reaches here only after `_flush_pending_child_events()`
+            # has assigned its exact span.
             parent_span_id = event.span_id or self.outer_span_id
             for spawned in find_spawned_agents(msg.tool_calls):
                 if spawned.call_id in self._agents:
@@ -166,12 +195,8 @@ class CodexConsumer(ModelEventSink):
                 self._agents[spawned.call_id] = _OpenAgent(
                     call_id=spawned.call_id,
                     span_id=span_id,
-                    prompt=spawned.message,
-                    name=spawned.name,
                 )
                 metadata: dict[str, str] = {"agent_type": spawned.agent_type}
-                if spawned.task_name:
-                    metadata["task_name"] = spawned.task_name
                 if spawned.reasoning_effort:
                     metadata["reasoning_effort"] = spawned.reasoning_effort
                 transcript()._event(
@@ -179,25 +204,33 @@ class CodexConsumer(ModelEventSink):
                         id=span_id,
                         parent_id=parent_span_id,
                         type="agent",
-                        name=spawned.name,
+                        name=spawned.agent_type,
                         metadata=metadata,
                     )
                 )
 
             # explicit close_agent calls
             for target in find_close_targets(msg.tool_calls):
-                self._close_thread(target)
+                self._close_agent_key(target)
 
         if id(event) in self._emitted_events:
             self._emitted_events.discard(id(event))
             transcript()._event_updated(event)
 
-    # ------------------------------------------------------------------
-    # internal
-    # ------------------------------------------------------------------
+    def _emit_event(self, event: ModelEvent) -> None:
+        if is_compaction_request(event.input):
+            transcript()._event(
+                CompactionEvent(
+                    source="codex_cli",
+                    span_id=event.span_id,
+                    metadata={"trigger": "auto"},
+                )
+            )
+        self._emitted_events.add(id(event))
+        transcript()._event(event)
 
     def _harvest_bindings(self, input_messages: list[ChatMessage]) -> None:
-        """Bind thread_id → span from spawn_agent tool results (by tool_call_id)."""
+        """Bind a native spawn result key to its exact open tool-call span."""
         for msg in input_messages:
             if not isinstance(msg, ChatMessageTool):
                 continue
@@ -205,102 +238,68 @@ class CodexConsumer(ModelEventSink):
             if result is None or msg.tool_call_id is None:
                 continue
             if result.nickname is not None:
-                self._nicknames[result.agent_id] = result.nickname
+                self._nicknames[result.native_key] = result.nickname
             agent = self._agents.get(msg.tool_call_id)
-            if agent is not None and agent.thread_id is None:
-                agent.thread_id = result.agent_id
-                self._thread_index[result.agent_id] = msg.tool_call_id
+            if agent is not None and agent.native_key is None:
+                agent.native_key = result.native_key
+                self._agent_key_index.setdefault(result.native_key, set()).add(
+                    msg.tool_call_id
+                )
 
-    def _close_thread(self, thread_id: str) -> None:
-        call_id = self._thread_index.pop(thread_id, None)
-        if call_id is None:
-            return
-        agent = self._agents.pop(call_id, None)
-        if agent is None:
-            return
-        transcript()._event(SpanEndEvent(id=agent.span_id))
+    def _flush_pending_child_events(self) -> None:
+        """Emit held native-recipient events after an exact unique binding."""
+        pending_events: list[_PendingChildEvent] = []
+        for pending in self._pending_child_events:
+            span_id = self._child_span_for_recipients(pending.recipients)
+            if span_id is None:
+                pending_events.append(pending)
+                continue
+            pending.event.span_id = span_id
+            self._emit_event(pending.event)
+            if id(pending.event) in self._completed_pending_events:
+                self._completed_pending_events.discard(id(pending.event))
+                self._complete_event(pending.event)
+        self._pending_child_events = pending_events
 
-    def _attribute(self, input_messages: list[ChatMessage]) -> str | None:
-        """Resolve the span_id for an incoming bridge call.
-
-        Multi-Agent V2 first: every agent_message in a request is inbound to
-        the requester, so a single recipient path identifies the calling agent
-        exactly (spawn prompts are encrypted under V2, so substring matching
-        cannot work). Falls back to the V1 heuristic: substring-match the
-        call's user-message text against open spawn prompts. Exactly one
-        match → that sub-agent's span; zero/multiple → outer span (defensive
-        default).
-        """
-        if not self._agents:
-            return self.outer_span_id
-
-        span_id = self._attribute_by_recipient(input_messages)
-        if span_id is not None:
-            return span_id
-
-        user_text = self._user_text(input_messages)
-        if not user_text:
-            return self.outer_span_id
-
-        matches = [
-            agent
-            for agent in self._agents.values()
-            if len(agent.prompt) >= _MIN_PROMPT_LENGTH and agent.prompt in user_text
-        ]
-        if len(matches) == 1:
-            return matches[0].span_id
-        return self.outer_span_id
-
-    def _attribute_by_recipient(self, input_messages: list[ChatMessage]) -> str | None:
-        """Resolve a call's span from its agent_message recipient (V2).
-
-        A bound thread id (from a spawn result or an earlier call) resolves
-        directly. Otherwise the recipient's final path segment is matched
-        against open spawns awaiting their first call (the spawn call carries
-        the relative task_name, the recipient carries the absolute path, e.g.
-        "write_fizzbuzz" vs "/root/write_fizzbuzz") — a unique match binds the
-        thread id so later calls and FINAL_ANSWER closes resolve directly.
-        Returns None (fall through) when no unambiguous match exists.
-        """
-        recipients = agent_message_recipients(input_messages)
-        if len(recipients) != 1:
+    def _child_span_for_recipients(self, recipients: set[str]) -> str | None:
+        """Return one open span only when every recipient maps to that span."""
+        if not recipients:
             return None
-        recipient = next(iter(recipients))
+        call_ids: set[str] = set()
+        for recipient in recipients:
+            candidates = self._agent_key_index.get(recipient)
+            if candidates is None or len(candidates) != 1:
+                return None
+            call_ids.update(candidates)
+        if len(call_ids) != 1:
+            return None
+        agent = self._agents.get(call_ids.pop())
+        return agent.span_id if agent is not None else None
 
-        # already bound (spawn result or earlier call)
-        call_id = self._thread_index.get(recipient)
-        if call_id is not None:
-            agent = self._agents.get(call_id)
+    def _close_agent_key(self, native_key: str) -> None:
+        call_ids = self._agent_key_index.pop(native_key, set())
+        for call_id in call_ids:
+            agent = self._agents.pop(call_id, None)
             if agent is not None:
-                return agent.span_id
+                transcript()._event(SpanEndEvent(id=agent.span_id))
 
-        # first call from this thread: bind by task name (last path segment)
-        basename = recipient.rsplit("/", 1)[-1]
-        candidates = [
-            agent
-            for agent in self._agents.values()
-            if agent.thread_id is None and agent.name == basename
-        ]
-        if len(candidates) == 1:
-            agent = candidates[0]
-            agent.thread_id = recipient
-            self._thread_index[recipient] = agent.call_id
-            return agent.span_id
 
+def _root_thread_id(metadata: object) -> str | None:
+    """Return the bridge-projected native root thread identity, if present."""
+    if not isinstance(metadata, dict):
         return None
-
-    @staticmethod
-    def _user_text(input_messages: list[ChatMessage]) -> str:
-        """Concatenated text of user messages used for attribution.
-
-        Excludes `<subagent_notification>` messages: those appear in a *parent's*
-        input and carry sub-agent *answers* (not spawn prompts), which could
-        otherwise cause a parent call to false-match a sub-agent span.
-        """
-        return "\n".join(
-            msg.text
-            for msg in input_messages
-            if isinstance(msg, ChatMessageUser)
-            and msg.text
-            and "<subagent_notification>" not in msg.text
-        )
+    agent_bridge = metadata.get("agent_bridge")
+    if not isinstance(agent_bridge, dict):
+        return None
+    codex = agent_bridge.get("codex")
+    if not isinstance(codex, dict):
+        return None
+    thread_id = codex.get("thread_id")
+    if (
+        isinstance(thread_id, str)
+        and thread_id
+        and "parent_thread_id" not in codex
+        and "subagent" not in codex
+    ):
+        return thread_id
+    return None
