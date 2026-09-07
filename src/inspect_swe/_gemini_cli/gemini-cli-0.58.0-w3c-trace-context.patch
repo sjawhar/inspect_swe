@@ -1,0 +1,66 @@
+--- a/node_modules/@google/gemini-cli/bundle/chunk-MFLFXOVQ.js
++++ b/node_modules/@google/gemini-cli/bundle/chunk-MFLFXOVQ.js
+@@ -310382,6 +310382,34 @@
+     mcp_servers: mcpServers
+   };
+ }
++var W3C_TRACE_CONTEXT_HEADERS = ["traceparent", "tracestate"];
++function withW3cTraceContext(request) {
++  const propagatedHeaders = {};
++  propagation.inject(context.active(), propagatedHeaders);
++  const traceHeaders = {};
++  for (const header of W3C_TRACE_CONTEXT_HEADERS) {
++    const value = propagatedHeaders[header];
++    if (value !== void 0) {
++      traceHeaders[header] = value;
++    }
++  }
++  if (Object.keys(traceHeaders).length === 0) {
++    return request;
++  }
++  return {
++    ...request,
++    config: {
++      ...request.config,
++      httpOptions: {
++        ...request.config?.httpOptions,
++        headers: {
++          ...request.config?.httpOptions?.headers,
++          ...traceHeaders
++        }
++      }
++    }
++  };
++}
+ var LoggingContentGenerator = class {
+   wrapped;
+   config;
+@@ -310495,7 +310523,7 @@
+       const serverDetails = this._getEndpointUrl(req, "generateContent");
+       this.logApiRequest(contents, req.model, userPromptId, role, req.config, serverDetails);
+       try {
+-        const response = await this.wrapped.generateContent(req, userPromptId, role);
++        const response = await this.wrapped.generateContent(withW3cTraceContext(req), userPromptId, role);
+         spanMetadata.output = response.candidates?.[0]?.content ?? null;
+         spanMetadata.attributes[GEN_AI_USAGE_INPUT_TOKENS] = response.usageMetadata?.promptTokenCount ?? 0;
+         spanMetadata.attributes[GEN_AI_USAGE_OUTPUT_TOKENS] = response.usageMetadata?.candidatesTokenCount ?? 0;
+@@ -310540,7 +310568,7 @@
+       this.logApiRequest(toContents(req.contents), req.model, userPromptId, role, req.config, serverDetails);
+       let stream2;
+       try {
+-        stream2 = await this.wrapped.generateContentStream(req, userPromptId, role);
++        stream2 = await this.wrapped.generateContentStream(withW3cTraceContext(req), userPromptId, role);
+       } catch (error40) {
+         const durationMs = Date.now() - startTime;
+         this._fixGaxiosErrorData(error40);
+@@ -366150,7 +366150,9 @@
+       const firstItem = result2.content[0];
+       if (firstItem.type === "text" && typeof firstItem.text === "string") {
+         try {
+           const parsed = JSON.parse(firstItem.text);
+-          result2.structuredContent = parsed;
++          if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
++            result2.structuredContent = parsed;
++          }
+         } catch {
+         }

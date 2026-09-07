@@ -1,7 +1,8 @@
 from typing import Any
 
 import pytest
-from inspect_ai.model import Model
+from inspect_ai.agent._bridge.util import resolve_inspect_model
+from inspect_ai.model import Model, get_model
 from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
 from inspect_swe import codex_cli, interactive_codex_cli
 from inspect_swe._codex_cli.config import (
@@ -247,6 +248,47 @@ def test_codex_cli_accepts_auto_review() -> None:
     codex_cli(
         auto_review=CodexAutoReview(policy="Deny package installs.", model="guardian")
     )
+
+
+def test_codex_cli_accepts_auto_review_with_transparent_proxy() -> None:
+    codex_cli(auto_review=True, transparent_proxy=True)
+
+
+def test_transparent_proxy_leaves_guardian_slug_unaliased() -> None:
+    # With auto_review enabled but no explicit CodexAutoReview(model=...),
+    # transparent_proxy must NOT bind codex's hardcoded guardian slug to the
+    # session model: that redirect is the agent reviewing itself. The slug is
+    # left for the bridge to resolve from the request, exactly like any other
+    # name codex sends.
+    aliases = resolve_codex_auto_review_model_aliases(
+        resolve_codex_auto_review(True), None
+    )
+    assert aliases is None
+
+
+def test_transparent_proxy_without_fallback_sends_bare_names_to_the_bridge() -> None:
+    # codex_cli()'s execute() passes model=None under transparent_proxy=True, so
+    # neither codex's own --model slug nor the guardian slug is redirected to
+    # the session model. On a bridge that cannot resolve a bare name (no
+    # endpoint-provider inference) both requests fail loudly here rather than
+    # silently landing on the wrong model -- which is why transparent_proxy is
+    # opt-in and its docstring names that bridge requirement.
+    aliases = resolve_codex_auto_review_model_aliases(
+        resolve_codex_auto_review(True), None
+    )
+    for slug in (GUARDIAN_MODEL_SLUG, "gpt-5.1-codex"):
+        with pytest.raises(ValueError, match="<api_name>/<model_name>"):
+            resolve_inspect_model(slug, aliases, None)
+
+
+def test_explicit_guardian_model_still_binds_under_transparent_proxy() -> None:
+    # An explicit CodexAutoReview(model=...) is a deliberate routing choice and
+    # survives transparent_proxy: the alias table is kept, only the fallback goes.
+    guardian = get_model("mockllm/model")
+    aliases = resolve_codex_auto_review_model_aliases(
+        CodexAutoReview(model=guardian), None
+    )
+    assert resolve_inspect_model(GUARDIAN_MODEL_SLUG, aliases, None) is guardian
 
 
 def test_interactive_codex_cli_accepts_auto_review(

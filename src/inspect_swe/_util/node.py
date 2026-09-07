@@ -12,6 +12,7 @@ import subprocess
 import tarfile
 import tempfile
 from io import BytesIO
+from pathlib import Path
 
 from inspect_ai.util import SandboxEnvironment, concurrency
 
@@ -152,10 +153,10 @@ def create_npm_bundle(
     cache_dir = package_cache_dir(cache_name)
     suffix = "-noscripts" if ignore_scripts else ""
     cache_path = cache_dir / f"{cache_name}-{version}-{platform}{suffix}.tar.gz"
-
     if cache_path.exists():
-        with open(cache_path, "rb") as f:
-            return f.read()
+        cached_bundle = _read_cached_npm_bundle(cache_path)
+        if cached_bundle is not None:
+            return cached_bundle
 
     if not shutil.which("npm"):
         raise RuntimeError(
@@ -216,9 +217,34 @@ def create_npm_bundle(
         bundle_data = buffer.getvalue()
 
     cache_dir.mkdir(parents=True, exist_ok=True)
-    with open(cache_path, "wb") as f:
-        f.write(bundle_data)
+    with tempfile.NamedTemporaryFile(
+        mode="wb", dir=cache_dir, prefix=f".{cache_path.name}.", delete=False
+    ) as cache_file:
+        cache_file.write(bundle_data)
+        temporary_cache_path = Path(cache_file.name)
+    try:
+        os.replace(temporary_cache_path, cache_path)
+    finally:
+        temporary_cache_path.unlink(missing_ok=True)
 
+    return bundle_data
+
+
+def _read_cached_npm_bundle(cache_path: Path) -> bytes | None:
+    """Return a complete npm archive or remove an interrupted cache publication."""
+    try:
+        bundle_data = cache_path.read_bytes()
+        with tarfile.open(fileobj=BytesIO(bundle_data), mode="r:gz") as archive:
+            member_names = set(archive.getnames())
+        if (
+            "package.json" not in member_names
+            or "package-lock.json" not in member_names
+            or not any(name.startswith("node_modules/") for name in member_names)
+        ):
+            raise tarfile.TarError("npm bundle is missing its production closure")
+    except (OSError, tarfile.TarError):
+        cache_path.unlink(missing_ok=True)
+        return None
     return bundle_data
 
 

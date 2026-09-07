@@ -1,9 +1,10 @@
 import json
 import re
 import shlex
+import uuid
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, Literal, Sequence
+from typing import Any, Iterable, Literal, Mapping, Sequence
 
 from inspect_ai.agent import (
     Agent,
@@ -14,7 +15,13 @@ from inspect_ai.agent import (
     agent_with,
     sandbox_agent_bridge,
 )
-from inspect_ai.model import ChatMessageSystem, GenerateFilter, Model, ModelResolver
+from inspect_ai.model import (
+    ChatMessage,
+    ChatMessageSystem,
+    GenerateFilter,
+    Model,
+    ModelResolver,
+)
 from inspect_ai.scorer import score
 from inspect_ai.tool import MCPServerConfig, Skill, install_skills, read_skills
 from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
@@ -43,6 +50,89 @@ AntigravityEffort = Literal["low", "medium", "high"]
 # the CLI's own state, MCP servers in the shared `~/.gemini/config` tree.
 _SETTINGS_DIR = ".gemini/antigravity-cli"
 _MCP_CONFIG_DIR = ".gemini/config"
+
+
+# The CLI states the identity of its own conversation in every primary request:
+# official 1.1.27/1.1.28 requests carry exactly one system
+# `<user_information>` block containing `Conversation ID: <UUID>`, while the
+# title-generation conversation the CLI opens alongside carries no such block.
+_USER_INFORMATION_BLOCK = re.compile(
+    r"<user_information>(.*?)</user_information>", re.DOTALL
+)
+_CONVERSATION_ID_LINE = re.compile(r"^[ \t]*Conversation ID:[ \t]*(\S+)[ \t]*$", re.M)
+_USER_INFORMATION_DELIMITER = re.compile(r"</?user_information>")
+
+
+def _framed_blocks(text: str) -> list[str]:
+    """Return complete `<user_information>` block bodies from one message."""
+    delimiters = _USER_INFORMATION_DELIMITER.findall(text)
+    alternating = [
+        "<user_information>" if index % 2 == 0 else "</user_information>"
+        for index in range(len(delimiters))
+    ]
+    if len(delimiters) % 2 or delimiters != alternating:
+        raise ValueError(
+            f"antigravity cli framed its <user_information> with {len(delimiters)} "
+            "delimiters that do not open and close complete blocks"
+        )
+    return _USER_INFORMATION_BLOCK.findall(text)
+
+
+def _validated_conversation_id(value: str) -> str:
+    """Return a UUID conversation id without normalising its printable form."""
+    try:
+        uuid.UUID(value)
+    except ValueError as ex:
+        raise ValueError(
+            f"antigravity cli declared a malformed conversation id {value!r}"
+        ) from ex
+    return value
+
+
+def _native_conversation_id(messages: Sequence[ChatMessage]) -> str | None:
+    """Read the CLI conversation id declared in one model request.
+
+    An auxiliary title request carries no system `<user_information>` block.
+    Every other framing fault is invalid rather than a signal to guess.
+    """
+    blocks = [
+        block
+        for message in messages
+        if isinstance(message, ChatMessageSystem)
+        for block in _framed_blocks(message.text)
+    ]
+    if not blocks:
+        return None
+    if len(blocks) > 1:
+        raise ValueError(
+            f"antigravity cli declared {len(blocks)} <user_information> blocks "
+            "in one request; expected exactly one carrying its conversation id"
+        )
+
+    declared = _CONVERSATION_ID_LINE.findall(blocks[0])
+    if len(declared) != 1:
+        raise ValueError(
+            "antigravity cli declared a <user_information> block carrying "
+            f"{len(declared)} conversation ids; expected exactly one"
+        )
+    return _validated_conversation_id(declared[0])
+
+
+class _NativeConversation:
+    """Track the canonical Antigravity conversation for one invocation."""
+
+    def __init__(self, *, unattended: bool, bound_id: str | None = None) -> None:
+        self._unattended = unattended
+        self.bound_id: str | None = bound_id
+
+    def accept(self, messages: Sequence[ChatMessage]) -> bool:
+        """Accept a primary request, rejecting only auxiliary or foreign traffic."""
+        conversation_id = _native_conversation_id(messages)
+        if conversation_id is None:
+            return False
+        if self.bound_id is None:
+            self.bound_id = conversation_id
+        return not self._unattended or self.bound_id == conversation_id
 
 
 @agent
@@ -154,6 +244,13 @@ def antigravity_cli(
         port = store().get(MODEL_PORT, 3000) + 1
         store().set(MODEL_PORT, port)
 
+        prior_conversation_id = (
+            _native_conversation_id(state.messages) if centaur is False else None
+        )
+        conversation = _NativeConversation(
+            unattended=centaur is False, bound_id=prior_conversation_id
+        )
+
         async with sandbox_agent_bridge(
             state,
             model=model,
@@ -165,6 +262,7 @@ def antigravity_cli(
             bridged_tools=bridged_tools,
             model_resolver=model_resolver,
             accumulate_conversations=accumulate_conversations,
+            state_filter=conversation.accept,
         ) as bridge:
             # resolve sandbox
             sbox = sandbox_env(sandbox)
@@ -194,11 +292,14 @@ def antigravity_cli(
             mcp_config_dir = join_path(sandbox_home, _MCP_CONFIG_DIR)
             await sbox.exec(["mkdir", "-p", settings_dir, mcp_config_dir], user=user)
             await sbox.write_file(
-                join_path(settings_dir, "settings.json"), build_antigravity_settings()
+                join_path(settings_dir, "settings.json"),
+                build_antigravity_settings(unattended=centaur is False),
             )
             await sbox.write_file(
                 join_path(mcp_config_dir, "mcp_config.json"),
-                build_antigravity_mcp_config(all_mcp_servers),
+                build_antigravity_mcp_config(
+                    all_mcp_servers, eager_tools=bridge.bridged_tools
+                ),
             )
 
             # build system prompt
@@ -209,6 +310,14 @@ def antigravity_cli(
                 system_messages.append(system_prompt)
 
             prompt, has_assistant_response = build_user_prompt(state.messages)
+
+            if centaur is False and has_assistant_response:
+                if prior_conversation_id is None:
+                    raise RuntimeError(
+                        "antigravity cli cannot resume: the conversation handed "
+                        "to this agent carries assistant turns but no native "
+                        "conversation id, so there is no conversation to continue"
+                    )
 
             # Prepend the system prompt to the user prompt: the CLI has no
             # separate --system-prompt flag (same as gemini_cli).
@@ -223,20 +332,19 @@ def antigravity_cli(
                 # Omitted only when explicitly disabled: models outside the
                 # 3.6/3.7 Flash families reject --effort as not adjustable.
                 *(["--effort", effort] if effort is not None else []),
-                "--output-format",
-                "text",
-                # A task prompt is arbitrary user text: without this, a prompt
-                # whose first token looks like `/something` is expanded as a
-                # slash command / skill instead of being sent to the model.
-                "--disable-slash-commands",
             ]
 
-            # Auto-approve tool calls (permission_mode "always-proceed"). In
-            # centaur mode the human at the terminal is the approver, so the
-            # flag is withheld -- exactly as gemini_cli withholds --yolo.
+            # These are print-mode concerns. The human at a Centaur terminal
+            # approves actions and reads ordinary output, so it receives none.
             if centaur is False:
-                cmd.append("--dangerously-skip-permissions")
-
+                cmd.extend(
+                    [
+                        "--disable-slash-commands",
+                        "--dangerously-skip-permissions",
+                        "--output-format",
+                        "json",
+                    ]
+                )
             agent_env = {
                 # The CLI's direct-Gemini-API route, pointed at the bridge. Both
                 # halves are required: the base URL alone leaves the CLI on its
@@ -252,7 +360,6 @@ def antigravity_cli(
                 # No D-Bus in a sandbox, so the CLI's keyring probe has nothing
                 # to talk to; the logo art is noise in a captured transcript.
                 "AGY_CLI_HIDE_LOGO": "1",
-                "PATH": "/usr/local/bin:/usr/bin:/bin",
                 "HOME": sandbox_home,
             } | (env or {})
 
@@ -285,6 +392,7 @@ def antigravity_cli(
                         cwd=agent_cwd,
                         user=user,
                         sandbox=sbox,
+                        sandbox_name=sandbox,
                         bridge_port=bridge.port,
                         session_id=None,
                     ),
@@ -298,9 +406,15 @@ def antigravity_cli(
                 while True:
                     agent_cmd = cmd.copy()
 
-                    # resume previous conversation
+                    # Resume by explicit id, never with the CLI's ambient
+                    # `--continue` selection.
                     if has_assistant_response or attempt_count > 0:
-                        agent_cmd.append("--continue")
+                        if conversation.bound_id is None:
+                            raise RuntimeError(
+                                "antigravity cli never declared a conversation "
+                                "id, so there is nothing to resume"
+                            )
+                        agent_cmd.extend(["--conversation", conversation.bound_id])
 
                     agent_cmd.extend(["--print", agent_prompt])
 
@@ -334,6 +448,8 @@ def antigravity_cli(
                             f"{_clean_antigravity_error(result.stdout, result.stderr)}"
                         )
 
+                    _verify_native_result(result.stdout, conversation.bound_id)
+
                     attempt_count += 1
                     if attempt_count >= attempts.attempts:
                         break
@@ -362,52 +478,33 @@ def antigravity_cli(
     return agent_with(execute, name=name, description=description)
 
 
-def build_antigravity_settings() -> str:
+def build_antigravity_settings(*, unattended: bool = True) -> str:
     """Build Antigravity CLI settings.json content.
 
-    `modelProvider` is the load-bearing key: it selects the direct Gemini API
-    route (`GEMINI_API_KEY` + `GOOGLE_GEMINI_BASE_URL`) instead of the OAuth
-    sign-in the CLI otherwise blocks on. Everything else here removes a way for
-    a headless run to stall or to reach outside the sandbox.
+    The direct Gemini route prevents sign-in. Approval policies are present
+    only for headless work; Centaur leaves those decisions to the human.
     """
     settings: dict[str, Any] = {
         "modelProvider": "gemini",
-        # Run tools without prompting. Redundant with
-        # --dangerously-skip-permissions for the unattended path, but the flag
-        # is withheld in centaur mode where the settings file still applies to
-        # anything the human launches.
-        "toolPermission": "always-proceed",
-        # Headless runs honor the persisted artifact-review policy, and the
-        # default ("asks-for-review") is a prompt nobody is there to answer.
-        "artifactReviewPolicy": "always-proceed",
-        # The CLI's own terminal sandbox. Isolation is the Inspect sandbox's job;
-        # the CLI's needs unprivileged user namespaces, which container policy
-        # typically denies.
-        #
-        # The four booleans below MUST be JSON booleans, not the "on"/"off"
-        # strings the settings documentation uses for them. A string is dropped
-        # on load with no error and no rewrite of the file, so `settings.json`
-        # keeps saying "off" while `/config` reports the default -- which is how
-        # the first cut of this shipped with telemetry still enabled.
+        # The CLI's own terminal sandbox requires unprivileged user namespaces,
+        # which the enclosing Inspect sandbox commonly denies.
         "enableTerminalSandbox": False,
-        # No usage statistics or crash reports off-box from an eval run.
         "enableTelemetry": False,
         "showTips": False,
         "showFeedbackSurvey": False,
-        # Sequential stdout rather than the alternate screen buffer: the run is
-        # captured as text, and alt-screen escape sequences corrupt it.
         "altScreenMode": "never",
     }
+    if unattended:
+        settings["toolPermission"] = "always-proceed"
+        settings["artifactReviewPolicy"] = "always-proceed"
     return json.dumps(settings, indent=2)
 
 
-def build_antigravity_mcp_config(mcp_servers: Sequence[MCPServerConfig]) -> str:
-    """Build Antigravity CLI mcp_config.json content.
-
-    The CLI's remote-server schema names the endpoint `serverUrl`; the `url` and
-    `httpUrl` spellings other agents accept are silently ignored, which presents
-    as a server that is configured but never connects.
-    """
+def build_antigravity_mcp_config(
+    mcp_servers: Sequence[MCPServerConfig],
+    eager_tools: Mapping[str, Iterable[str]],
+) -> str:
+    """Build Antigravity CLI mcp_config.json content."""
     servers: dict[str, Any] = {}
     for server in mcp_servers:
         config = server.model_dump(exclude={"name", "tools", "type"}, exclude_none=True)
@@ -415,6 +512,9 @@ def build_antigravity_mcp_config(mcp_servers: Sequence[MCPServerConfig]) -> str:
             config["serverUrl"] = config.pop("url")
         if "cwd" in config and not isinstance(config["cwd"], str):
             config["cwd"] = str(config["cwd"])
+        eager = sorted(eager_tools.get(server.name, ()))
+        if eager:
+            config["tools"] = {name: {"eager": True} for name in eager}
         servers[server.name] = config
     return json.dumps({"mcpServers": servers}, indent=2)
 
@@ -457,6 +557,55 @@ def _clean_antigravity_error(stdout: str, stderr: str) -> str:
     if len(cleaned) > _MAX_ERROR_LEN:
         cleaned = cleaned[:_MAX_ERROR_LEN] + "... (truncated)"
     return cleaned if cleaned else "Unknown error (no output)"
+
+
+def _native_result_json(stdout: str) -> Mapping[str, Any]:
+    """Return the single JSON result emitted by one headless CLI invocation."""
+    try:
+        parsed: Any = json.loads(stdout.strip())
+    except json.JSONDecodeError as ex:
+        raise RuntimeError(
+            "antigravity cli did not print exactly one JSON result on stdout "
+            f"({ex.msg}): {_clean_antigravity_error(stdout, '')}"
+        ) from ex
+
+    if not isinstance(parsed, dict):
+        raise RuntimeError(
+            f"antigravity cli printed a JSON {type(parsed).__name__} rather "
+            f"than a result object: {_clean_antigravity_error(stdout, '')}"
+        )
+    return parsed
+
+
+def _verify_native_result(stdout: str, conversation_id: str | None) -> None:
+    """Require a successful result from the exact conversation being scored."""
+    result = _native_result_json(stdout)
+    status = result.get("status")
+    if status != "SUCCESS":
+        raise RuntimeError(
+            f"antigravity cli reported status {status!r} for conversation "
+            f"{result.get('conversation_id')!r}; expected SUCCESS"
+        )
+
+    if conversation_id is None:
+        raise RuntimeError(
+            "antigravity cli reported success for conversation "
+            f"{result.get('conversation_id')!r}, but this run bound no "
+            "conversation at all"
+        )
+
+    returned = result.get("conversation_id")
+    if not isinstance(returned, str):
+        raise RuntimeError(
+            f"antigravity cli reported success with conversation id {returned!r} "
+            f"({type(returned).__name__}) rather than a string, while this run "
+            f"bound {conversation_id!r}"
+        )
+    if returned != conversation_id:
+        raise RuntimeError(
+            f"antigravity cli returned conversation {returned!r} but this run "
+            f"bound {conversation_id!r}; refusing to score a conversation it did not run"
+        )
 
 
 async def _run_antigravity_cli_centaur(

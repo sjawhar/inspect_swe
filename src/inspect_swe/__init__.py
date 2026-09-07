@@ -10,7 +10,14 @@ from ._mini_swe_agent.mini_swe_agent import mini_swe_agent
 from ._opencode.opencode import opencode
 from ._tools.download import AgentBinary, cached_agent_binaries, download_agent_binary
 from ._util.agentwheel import download_wheels_tarball
-from ._util.centaur import CentaurOptions
+from ._util.centaur import (
+    CentaurFinalize,
+    CentaurOptions,
+    CentaurReady,
+    CentaurRefresh,
+    CentaurSession,
+    CommandsFilter,
+)
 from ._util.sandbox import SandboxPlatform
 from .acp import ACPAgent, ACPAgentParams, acp_connection, bridge_mcp_to_acp
 from .acp._agents.claude_code import interactive_claude_code
@@ -44,7 +51,12 @@ __all__ = [
     "cached_agent_binaries",
     "AgentBinary",
     "SandboxPlatform",
+    "CentaurFinalize",
     "CentaurOptions",
+    "CentaurReady",
+    "CentaurRefresh",
+    "CentaurSession",
+    "CommandsFilter",
     "CodexAutoReview",
     "__version__",
     "download_wheels_tarball",

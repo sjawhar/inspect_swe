@@ -11,7 +11,13 @@ reasoning stream to stdout as ~2KB base64 Gemini thought signatures, one per
 turn, and the actual reason ("Error: timeout waiting for response") to stderr.
 """
 
-from inspect_swe._antigravity_cli.antigravity_cli import _clean_antigravity_error
+import json
+
+import pytest
+from inspect_swe._antigravity_cli.antigravity_cli import (
+    _clean_antigravity_error,
+    _verify_native_result,
+)
 
 REASON = "Error: timeout waiting for response"
 # Shaped like what agy actually prints: base64 signature then a closing tag on
@@ -50,3 +56,63 @@ def test_ordinary_output_is_preserved_verbatim() -> None:
 
 def test_no_output_is_reported_as_such() -> None:
     assert _clean_antigravity_error("", "") == "Unknown error (no output)"
+
+
+_RESULT_CID = "eccac0fd-d2b5-4b39-9888-175170faece0"
+_OTHER_CID = "16fd2706-8baf-433b-82eb-8c7fada847da"
+_NATIVE_RESULT = (
+    '{"conversation_id":"eccac0fd-d2b5-4b39-9888-175170faece0",'
+    '"status":"SUCCESS","response":"tool call for tool run_command\\n'
+    'FINAL_NATIVE_STORE_JSON\\n","duration_seconds":4.712014882,"num_turns":1,'
+    '"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,'
+    '"cache_read_tokens":0,"total_tokens":0}}'
+)
+
+
+def _result(status: str = "SUCCESS", conversation_id: str | None = _RESULT_CID) -> str:
+    payload = json.loads(_NATIVE_RESULT)
+    payload["conversation_id"] = conversation_id
+    payload["status"] = status
+    return json.dumps(payload)
+
+
+def test_successful_result_for_the_bound_conversation_verifies() -> None:
+    _verify_native_result(_result(), _RESULT_CID)
+
+
+def test_result_naming_another_conversation_fails() -> None:
+    with pytest.raises(RuntimeError, match=_OTHER_CID):
+        _verify_native_result(_result(conversation_id=_OTHER_CID), _RESULT_CID)
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        _result(status="ERROR"),
+        json.dumps({"conversation_id": _RESULT_CID}),
+        "",
+        "not json at all",
+        "{unclosed",
+        f"{_result()}\n{{unclosed",
+        f"{_result()}\n{_result()}",
+    ],
+)
+def test_only_one_success_result_envelope_is_accepted(result: str) -> None:
+    with pytest.raises(RuntimeError):
+        _verify_native_result(result, _RESULT_CID)
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        (_result(conversation_id=None), None),
+        (_result(conversation_id=_RESULT_CID), None),
+        (_result(conversation_id=None), _RESULT_CID),
+        (json.dumps({"conversation_id": 42, "status": "SUCCESS"}), _RESULT_CID),
+    ],
+)
+def test_missing_or_non_string_conversation_identity_fails(
+    result: str, expected: str | None
+) -> None:
+    with pytest.raises(RuntimeError):
+        _verify_native_result(result, expected)

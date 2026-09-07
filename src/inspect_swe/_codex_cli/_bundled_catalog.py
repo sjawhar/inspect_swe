@@ -9,8 +9,8 @@ trimmed snapshot of the fields the resolver reads
 sufficient.
 
 Snapshot source: ``openai/codex`` ``codex-rs/models-manager/models.json``
-(``rust-v0.145.0``, July 2026). Refresh when bumping the default Codex version;
-the live fetch keeps this exact when ``raw.githubusercontent.com`` is reachable.
+(``rust-v0.153.4``). Refresh when the latest Codex catalog changes; the live fetch
+keeps this exact when ``raw.githubusercontent.com`` is reachable.
 """
 
 from typing import Any
@@ -18,26 +18,44 @@ from typing import Any
 BUNDLED_CODEX_CATALOG: dict[str, Any] = {
     "models": [
         {
-            "slug": "gpt-5.6-sol",
+            "slug": "gpt-6-astra",
             "priority": 1,
             "apply_patch_tool_type": "freeform",
             "supports_search_tool": True,
         },
         {
+            "slug": "gpt-5.6-sol",
+            "priority": 6,
+            "apply_patch_tool_type": "freeform",
+            "supports_search_tool": True,
+        },
+        {
             "slug": "gpt-5.6-terra",
-            "priority": 2,
+            "priority": 7,
             "apply_patch_tool_type": "freeform",
             "supports_search_tool": True,
         },
         {
             "slug": "gpt-5.6-luna",
-            "priority": 3,
+            "priority": 8,
+            "apply_patch_tool_type": "freeform",
+            "supports_search_tool": True,
+        },
+        {
+            "slug": "gpt-daybreak-blue-latest",
+            "priority": 10,
+            "apply_patch_tool_type": "freeform",
+            "supports_search_tool": True,
+        },
+        {
+            "slug": "gpt-daybreak-red-latest",
+            "priority": 11,
             "apply_patch_tool_type": "freeform",
             "supports_search_tool": True,
         },
         {
             "slug": "gpt-5.5",
-            "priority": 7,
+            "priority": 12,
             "apply_patch_tool_type": "freeform",
             "supports_search_tool": True,
         },

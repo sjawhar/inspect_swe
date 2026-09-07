@@ -13,7 +13,14 @@ from inspect_ai.agent import (
     agent_with,
     sandbox_agent_bridge,
 )
-from inspect_ai.model import ChatMessageSystem, GenerateFilter, Model, StopReason
+from inspect_ai.model import (
+    ChatMessage,
+    ChatMessageSystem,
+    GenerateFilter,
+    Model,
+    ModelResolver,
+    StopReason,
+)
 from inspect_ai.scorer import score
 from inspect_ai.tool import (
     MCPServerConfig,
@@ -44,7 +51,12 @@ from inspect_swe._claude_code._events.stream import (
     StderrEvent,
     claude_code_event_stream,
 )
-from inspect_swe._util.centaur import CentaurOptions, run_centaur
+from inspect_swe._util.centaur import (
+    CentaurOptions,
+    CentaurSession,
+    CommandsFilter,
+    run_centaur,
+)
 from inspect_swe._util.mcp_ready import (
     DEFAULT_MCP_READY_TIMEOUT,
     wait_for_mcp_endpoints,
@@ -59,7 +71,7 @@ from .._util.sandbox import resolve_agent_cwd
 from .._util.trace import trace
 from .agentbinary import claude_code_binary_source
 from .env import claude_code_agent_env
-from .model import resolve_claude_code_models
+from .model import ClaudeCodeEffort, resolve_claude_code_models
 
 ClaudeCodePermissionMode = Literal[
     "acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"
@@ -128,12 +140,15 @@ def claude_code(
     attempts: int | AgentAttempts = 1,
     model: str | None = None,
     model_config: str | None = None,
+    effort: ClaudeCodeEffort | None = None,
     model_aliases: dict[str, str | Model] | None = None,
+    transparent_proxy: bool = False,
     opus_model: str | None = None,
     sonnet_model: str | None = None,
     haiku_model: str | None = None,
     subagent_model: str | None = None,
     filter: GenerateFilter | None = None,
+    commands_filter: CommandsFilter | None = None,
     permission_mode: ClaudeCodePermissionMode | None = None,
     retry_refusals: int | None = 3,
     retry_uncaught_errors: int | None = 3,
@@ -145,6 +160,10 @@ def claude_code(
     debug: bool | None = None,
     replace_system_prompt: str | None = None,
     allowlist_mcp_tools: bool = True,
+    allowlist_bridged_tools: bool = True,
+    *,
+    model_resolver: ModelResolver | None = None,
+    accumulate_conversations: bool = False,
     **deprecated_args: Unpack[ClaudeCodeDeprecatedArgs],
 ) -> Agent:
     """Claude Code agent.
@@ -185,14 +204,39 @@ def claude_code(
             bridged to the served Inspect model regardless. (Claude Code renders
             the genuine name/cutoff for recognized Anthropic ids and shows other
             ids verbatim.)
+        effort: Reasoning effort for the served model. Sets
+            `GenerateConfig.reasoning_effort` on the model backing this agent
+            (see `resolve_claude_code_models`), not a Claude Code CLI flag: the
+            bridge drops request-level generation config from the inner agent
+            by default, so passing this through the CLI would have no effect
+            on the model actually serving the request. `None` leaves the
+            model's own default effort in place.
         model_aliases: Optional mapping of model names to Model instances or model name strings.
             Allows using custom Model implementations (e.g., wrapped Agents) instead of standard models.
             When a model name in the mapping is referenced, the corresponding Model/string is used.
+        transparent_proxy: Forward the client's generation parameters as
+            authoritative instead of merging in the eval's active
+            `GenerateConfig` (defaults to `False`). Claude Code's auto-mode
+            security classifier makes its own internal model call under
+            `permission_mode="auto"`, and by default the classifier's own
+            generation parameters (e.g. `max_tokens`) are dropped in favor of
+            the eval's `GenerateConfig`. The classifier's model identity is
+            unaffected either way -- it already resolves through the
+            presented-identity/role aliases above (or the fallback model, for
+            any identity not covered by those), the same as every other
+            bridged request.
         opus_model: The model to use for `opus`, or for `opusplan` when Plan Mode is active. Defaults to `model`.
         sonnet_model: The model to use for `sonnet`, or for `opusplan` when Plan Mode is not active. Defaults to `model`.
         haiku_model: The model to use for haiku, or [background functionality](https://code.claude.com/docs/en/costs#background-token-usage). Defaults to `model`.
         subagent_model: The model to use for [subagents](https://code.claude.com/docs/en/sub-agents). Defaults to `model`.
         filter: Filter for intercepting bridged model requests.
+        commands_filter: In centaur mode only, filter or augment the human agent's
+            task commands (for example to install project-specific submit/score
+            commands). Ignored outside centaur mode.
+        model_resolver: Resolves model names to the underlying Inspect model for
+            each bridged request.
+        accumulate_conversations: In centaur mode, preserve the conversation
+            accumulated through consecutive operator commands.
         permission_mode: Claude Code `--permission-mode`. The complete CLI set is
             `"acceptEdits"`, `"auto"`, `"bypassPermissions"`, `"default"`,
             `"dontAsk"`, and `"plan"`. `"bypassPermissions"` is near-equivalent
@@ -205,7 +249,10 @@ def claude_code(
         retry_refusals: Should refusals be retried? Defaults to retrying up to 3 times.
         retry_uncaught_errors: Should uncaught errors (unexpected crashes of Claude Code) be retried. Defaults to retrying up to 3 times.
         cwd: Working directory to run claude code within.
-        env: Environment variables to set for claude code.
+        env: Environment variables to set for claude code. Applied last, so
+            they override the sandbox defaults inspect_swe sets (see
+            `_claude_code/env.py`); e.g. `CLAUDE_CODE_DISABLE_AUTO_MEMORY="0"`
+            re-enables auto-memory.
         user: User to execute claude code with.
         sandbox: Optional sandbox environment name.
         version: Version of claude code to use. One of:
@@ -220,8 +267,23 @@ def claude_code(
             mode except `"bypassPermissions"`: in unattended runs, excluded
             static tools are denied without prompting. Set `False` with
             `permission_mode="auto"` when Claude Code's first-party classifier
-            should adjudicate those tools. Bridged Inspect tools remain allowlisted
-            because an evaluation may depend on them being callable.
+            should adjudicate those tools. Bridged Inspect tools are governed
+            separately by `allowlist_bridged_tools`.
+        allowlist_bridged_tools: Whether to add bridged Inspect tools to
+            `--allowed-tools` (default `True`, preserving the behavior every
+            existing caller gets). Bridged tools are allowlisted by default
+            because an evaluation may depend on them being callable, and in
+            every mode except `"auto"` a tool left off `--allowed-tools` is
+            denied without prompting in an unattended run.
+
+            Set `False` ONLY with `permission_mode="auto"`, where an excluded
+            tool is adjudicated by the classifier rather than denied. This is
+            required for an evaluation that measures Claude Code's own auto-mode
+            classifier acting on bridged tools: an allow rule resolves at step 1
+            of the permission flow, BEFORE the classifier, so an allowlisted
+            bridged call is never reviewed. Left `True` under `"auto"`, a run
+            whose entire tool surface is bridged produces ZERO adjudications and
+            looks clean while being wholly unreviewed.
         **deprecated_args: Supports the deprecated `auto_mode` argument. Set
             `auto_mode=True` maps to `permission_mode="auto"`.
     """
@@ -243,6 +305,14 @@ def claude_code(
     effective_permission_mode = resolve_claude_code_deprecated_args(
         cast(dict[str, Any], deprecated_args), permission_mode
     )
+
+    if allowlist_bridged_tools is False and effective_permission_mode != "auto":
+        raise ValueError(
+            "allowlist_bridged_tools=False requires permission_mode='auto'. In "
+            "every other mode, a bridged tool excluded from --allowed-tools is "
+            "denied without prompting instead of being adjudicated by Claude "
+            "Code's classifier, so the eval would complete toolless."
+        )
 
     # allocate session_id once per agent instance so that all calls to execute()
     # for the same sample share the same session. this enables --resume <id> to
@@ -266,25 +336,33 @@ def claude_code(
         # full mechanism.
         consumer = LiveConsumer()
 
-        # Resolve the (cosmetic) model identities Claude Code presents to itself
-        # and the bridge aliases that route them to the real served model. The
-        # per-role env vars below carry the opus/sonnet/haiku/subagent names.
-        models = resolve_claude_code_models(
-            model,
-            model_config,
-            opus_model=opus_model,
-            sonnet_model=sonnet_model,
-            haiku_model=haiku_model,
-            subagent_model=subagent_model,
-            model_aliases=model_aliases,
+        # A resolver without an explicit model is the native interactive path:
+        # the CLI asks for the user's selected model and the bridge resolves it
+        # at request time. Avoid static presentation defaults that would pin
+        # the CLI to a factory-selected model.
+        dynamic_model = model_resolver is not None and model is None
+        models = (
+            None
+            if dynamic_model
+            else resolve_claude_code_models(
+                model,
+                model_config,
+                effort=effort,
+                opus_model=opus_model,
+                sonnet_model=sonnet_model,
+                haiku_model=haiku_model,
+                subagent_model=subagent_model,
+                model_aliases=model_aliases,
+            )
         )
 
         async with (
             checkpointer() as cp,
             sandbox_agent_bridge(
                 state,
-                model=models.bridge_model,
-                model_aliases=models.aliases,
+                model=models.bridge_model if models is not None else None,
+                model_aliases=models.aliases if models is not None else model_aliases,
+                forward_generation_config=transparent_proxy,
                 filter=filter,
                 sandbox=sandbox,
                 retry_refusals=retry_refusals,
@@ -295,6 +373,8 @@ def claude_code(
                 ),
                 model_event_sink=consumer,
                 checkpointer=cp,
+                model_resolver=model_resolver,
+                accumulate_conversations=accumulate_conversations,
             ) as bridge,
         ):
             if cp.attempt == "resume_for_scoring":
@@ -317,11 +397,9 @@ def claude_code(
                 if effective_permission_mode is not None
                 else ["--dangerously-skip-permissions"]
             )
-            cmd = [
-                *permission_flag,
-                "--model",
-                models.presented,
-            ]
+            cmd = [*permission_flag]
+            if models is not None:
+                cmd.extend(["--model", models.presented])
 
             # add interactive options if not running as centaur
             if centaur is False:
@@ -351,6 +429,7 @@ def claude_code(
                         static_mcp_servers,
                         bridged_mcp_servers,
                         allowlist_mcp_tools,
+                        allowlist_bridged_tools,
                     )
                 )
 
@@ -402,14 +481,37 @@ def claude_code(
                     required=True,
                 )
 
-            # centaur mode uses human_cli with custom instructions and bash rc
+            # Centaur begins only after the bridge, binary, command, environment,
+            # and working directory are all ready for the operator.
             if centaur:
-                await run_claude_code_centaur(
-                    options=centaur,
-                    claude_cmd=[claude_binary] + cmd,
-                    agent_env=agent_env,
-                    state=state,
+                invocation = _centaur_claude_cmd(
+                    claude_binary,
+                    cmd,
+                    state.messages,
+                    system_prompt,
+                    replace_system_prompt,
                 )
+                invocation[1:1] = ["--session-id", session_id]
+                try:
+                    return await run_claude_code_centaur(
+                        options=centaur,
+                        claude_cmd=invocation,
+                        agent_env=agent_env,
+                        session=CentaurSession(
+                            state=bridge.state,
+                            invocation=tuple(invocation),
+                            environment=agent_env,
+                            cwd=agent_cwd,
+                            user=user,
+                            sandbox=sbox,
+                            bridge_port=bridge.port,
+                            session_id=session_id,
+                        ),
+                        consumer=consumer,
+                        commands_filter=commands_filter,
+                    )
+                finally:
+                    consumer.reset()
             else:
                 # execute the agent (track debug output)
                 debug_output: list[str] = []
@@ -431,15 +533,8 @@ def claude_code(
                         # resume. Appended messages are not re-sent because the bridge
                         # round-trips them into state.messages and appending them again
                         # would duplicate the effective prompt.
-                        system_texts = [
-                            m.text
-                            for m in state.messages
-                            if isinstance(m, ChatMessageSystem)
-                        ]
-                        if system_prompt is not None:
-                            system_texts.append(system_prompt)
                         system_args = _system_prompt_args(
-                            system_texts,
+                            _system_texts(state.messages, system_prompt),
                             replace_system_prompt,
                             is_resume=is_resume,
                         )
@@ -466,6 +561,7 @@ def claude_code(
                         # left open (e.g. Claude exited mid-Task before the
                         # tool_result), so SpanBegin/End stay balanced.
                         consumer.reset()
+                        consumer.configure_centaur_session(sbox, user, session_id)
 
                         # Retry-loop gate: fires ONLY when this loop is actually
                         # retrying (attempt_count > 0 or uncaught_error_count > 0),
@@ -506,7 +602,9 @@ def claude_code(
 
                         async for cc_event in claude_code_event_stream(proc):
                             if isinstance(cc_event, JsonlEvent):
-                                consumer.process_jsonl_line(cc_event.raw)
+                                consumer.process_jsonl_line(
+                                    cc_event.raw, from_stdout=True
+                                )
                                 if cc_debug is not None:
                                     cc_debug.stdout.append(cc_event.line)
                             elif isinstance(cc_event, JsonlParseError):
@@ -520,6 +618,12 @@ def claude_code(
                                     cc_debug.stderr.append(cc_event.data)
                             elif isinstance(cc_event, ExitEvent):
                                 exit_code = cc_event.code
+
+                        # Claude's stream-json stdout excludes native child
+                        # records. The completed process has persisted its owned
+                        # root and sidecar JSONL files, so bind those exact IDs
+                        # before exit handling or attempt scoring.
+                        await consumer.drain_completion()
 
                         if debug:
                             debug_output.append(stderr_data)
@@ -602,6 +706,50 @@ def claude_code(
     return agent_with(execute, name=name, description=description)
 
 
+def _system_texts(
+    messages: Sequence[ChatMessage], system_prompt: str | None
+) -> list[str]:
+    """System texts to append: the task's own, then the caller's.
+
+    Shared by the centaur and unattended launches so the operator's `claude`
+    alias and the unattended agent cannot disagree about the effective prompt.
+    """
+    texts = [m.text for m in messages if isinstance(m, ChatMessageSystem)]
+    if system_prompt is not None:
+        texts.append(system_prompt)
+    return texts
+
+
+def _centaur_claude_cmd(
+    claude_binary: str,
+    cmd: Sequence[str],
+    messages: Sequence[ChatMessage],
+    system_prompt: str | None,
+    replace_system_prompt: str | None,
+) -> list[str]:
+    """The `claude` invocation aliased into the operator's centaur shell.
+
+    Carries the SAME system prompt the unattended launch builds. Without the
+    prompt args here, `system_prompt` and `replace_system_prompt` are silently
+    dropped in centaur mode: the human's session runs with Claude Code's stock
+    prompt while the caller has every reason to believe the one it passed is in
+    effect.
+
+    `is_resume=False` because the alias always starts a fresh session --
+    `claude --resume` is the operator's own call, and re-sending an append there
+    would duplicate the effective prompt.
+    """
+    return (
+        [claude_binary]
+        + list(cmd)
+        + _system_prompt_args(
+            _system_texts(messages, system_prompt),
+            replace_system_prompt,
+            is_resume=False,
+        )
+    )
+
+
 def _system_prompt_args(
     system_texts: Sequence[str],
     replace_system_prompt: str | None,
@@ -668,13 +816,18 @@ def resolve_allowed_mcp_tools(
     static_mcp_servers: Sequence[MCPServerConfig],
     bridged_mcp_servers: Sequence[MCPServerConfig],
     allowlist_mcp_tools: bool,
+    allowlist_bridged_tools: bool = True,
 ) -> list[str]:
     static_allowed_tools = (
         resolve_mcp_server_allowed_tools(static_mcp_servers)
         if allowlist_mcp_tools
         else []
     )
-    bridged_allowed_tools = resolve_mcp_server_allowed_tools(bridged_mcp_servers)
+    bridged_allowed_tools = (
+        resolve_mcp_server_allowed_tools(bridged_mcp_servers)
+        if allowlist_bridged_tools
+        else []
+    )
     return [*static_allowed_tools, *bridged_allowed_tools]
 
 
@@ -700,11 +853,21 @@ async def run_claude_code_centaur(
     options: CentaurOptions,
     claude_cmd: list[str],
     agent_env: dict[str, str],
-    state: AgentState,
-) -> None:
-    instructions = "Claude Code:\n\n - You may also use Claude Code via the 'claude' command.\n - Use 'claude --resume' if you need to resume a previous claude session."
+    session: CentaurSession,
+    consumer: LiveConsumer,
+    commands_filter: CommandsFilter | None = None,
+) -> AgentState:
+    """Run one interactive Claude session against its wrapper-owned transcript."""
+    instructions = (
+        "Claude Code:\n\n - You may also use Claude Code via the 'claude' command."
+    )
+    if session.session_id is None:
+        raise RuntimeError("Claude Centaur requires a wrapper-owned session ID.")
+    consumer.configure_centaur_session(
+        session.sandbox, session.user, session.session_id
+    )
+    session.refresh = consumer.refresh
 
-    # build .bashrc content
     agent_env_vars = [f'export {k}="{v}"' for k, v in agent_env.items()]
     claude_config = """echo '{"hasCompletedOnboarding":true,"bypassPermissionsModeAccepted":true}' > "$HOME"/.claude.json"""
     path_config = [
@@ -712,14 +875,45 @@ async def run_claude_code_centaur(
         'export PATH="$HOME/.local/bin:$PATH"',
         f'ln -sf {claude_cmd[0]} "$HOME/.local/bin/claude"',
     ]
-    alias_cmd = shlex.join(claude_cmd)
-    alias_cmd = "alias claude='" + alias_cmd.replace("'", "'\\''") + "'"
+    if claude_cmd[1:3] != ["--session-id", session.session_id]:
+        raise RuntimeError("Claude Centaur command lost its wrapper-owned session ID.")
+    wrapped_command = shlex.join(claude_cmd)
+    resume_command = shlex.join(
+        [claude_cmd[0], "--resume", session.session_id, *claude_cmd[3:]]
+    )
+    session_id = shlex.quote(session.session_id)
+    alias_cmd = dedent(f"""\
+        claude() {{
+          case "$1" in
+            --resume|-r)
+              if [ "$2" = {session_id} ]; then
+                shift 2
+              elif [ -z "$2" ] || [ "${{2#-}}" != "$2" ]; then
+                shift
+              else
+                printf '%s\\n' 'Centaur Claude sessions may only resume the wrapper-owned session.' >&2
+                return 2
+              fi
+              command {resume_command} "$@"
+              ;;
+            --continue|-c)
+              shift
+              command {resume_command} "$@"
+              ;;
+            *)
+              command {wrapped_command} "$@"
+              ;;
+          esac
+        }}
+    """).strip()
+    login_cwd = f"cd -- {shlex.quote(session.cwd)}"
     bashrc = "\n".join(
-        agent_env_vars + path_config + ["", claude_config, "", alias_cmd]
+        agent_env_vars + path_config + ["", claude_config, "", alias_cmd, login_cwd]
     )
 
-    # run the human cli
-    await run_centaur(options, instructions, bashrc, state)
+    return await run_centaur(
+        options, instructions, bashrc, session, commands_filter=commands_filter
+    )
 
 
 class ClaudeCodeDebug(StoreModel):

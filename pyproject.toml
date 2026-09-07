@@ -24,6 +24,7 @@ dependencies = [
     "anyio",
     "typing_extensions>=4.9.0",
     "agent-client-protocol>=0.11.0",
+    "google-genai>=1.69.0",
 ]
 
 [project.urls]
@@ -70,6 +71,10 @@ version-file = "src/inspect_swe/_version.py"
 
 [tool.hatch.version.raw-options]
 local_scheme = "no-local-version" # Important for PyPI compatibility
+# Used only when no tag is reachable (e.g. a shallow/tag-less `uv` git-URL
+# fetch of a single commit) -- normal tagged checkouts/releases still get a
+# real git-describe-derived version and ignore this.
+fallback_version = "0.2.66"
 
 [tool.hatch.metadata]
 allow-direct-references = true
@@ -113,4 +118,11 @@ python_executable = ".venv/bin/python"
 # not to require types for it on the host.
 [[tool.mypy.overrides]]
 module = ["google.antigravity.*"]
+ignore_missing_imports = true
+
+# inspect_cyber is only used by examples/ (guarded by a try/except with install
+# instructions) and is not a project dependency; tell mypy not to require types
+# for it when checking examples on the host.
+[[tool.mypy.overrides]]
+module = ["inspect_cyber.*"]
 ignore_missing_imports = true

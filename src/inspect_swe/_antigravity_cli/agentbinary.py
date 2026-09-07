@@ -18,7 +18,7 @@ _RELEASES_REPO = "google-antigravity/antigravity-cli"
 # Only glibc Linux builds are published: there is no musl asset. Fail loud on a
 # musl platform rather than installing the glibc binary, which would die at exec
 # time with an unhelpful "not found" from the loader.
-_PLATFORM_ASSETS: dict[str, str] = {
+_PLATFORM_ASSETS: dict[SandboxPlatform, str] = {
     "linux-x64": "agy_cli_linux_x64.tar.gz",
     "linux-arm64": "agy_cli_linux_arm64.tar.gz",
 }
@@ -30,15 +30,17 @@ def antigravity_cli_binary_source() -> AgentBinarySource:
     async def resolve_version(
         version: Literal["stable", "latest"] | str, platform: SandboxPlatform
     ) -> AgentBinaryVersion:
-        if version in ("stable", "latest"):
-            version = await _fetch_latest_version()
-
+        # An unsupported platform is knowable without the network. Report it
+        # before attempting a release lookup that would hide the real fault.
         asset_name = _PLATFORM_ASSETS.get(platform)
         if asset_name is None:
             raise ValueError(
                 f"Unsupported platform for the Antigravity CLI: {platform}. "
                 f"Supported: {sorted(_PLATFORM_ASSETS)}."
             )
+
+        if version in ("stable", "latest"):
+            version = await _fetch_latest_version()
 
         release = await _fetch_release(version)
         assets = {
@@ -55,10 +57,14 @@ def antigravity_cli_binary_source() -> AgentBinarySource:
         digest = asset.get("digest", "")
         if not isinstance(digest, str) or not digest.startswith("sha256:"):
             raise RuntimeError(f"Invalid digest format: {digest!r}")
+        download_url = asset.get("browser_download_url")
+        if not isinstance(download_url, str) or not download_url:
+            raise RuntimeError(
+                f"Asset {asset_name} in Antigravity CLI release {version} "
+                "has no browser_download_url"
+            )
 
-        return AgentBinaryVersion(
-            version, digest.removeprefix("sha256:"), asset["browser_download_url"]
-        )
+        return AgentBinaryVersion(version, digest.removeprefix("sha256:"), download_url)
 
     def cached_binary_path(version: str, platform: SandboxPlatform) -> Path:
         return cached_binary_dir / f"agy-{version}-{platform}"

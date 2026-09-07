@@ -2,7 +2,7 @@ from inspect_ai import Task, eval, task
 from inspect_ai.dataset import Sample
 from inspect_swe import claude_code
 
-from tests.conftest import skip_if_no_k8s
+from tests.conftest import skip_if_no_anthropic, skip_if_no_k8s
 
 
 @task
@@ -14,6 +14,7 @@ def t() -> Task:
     )
 
 
+@skip_if_no_anthropic
 @skip_if_no_k8s
 def test_k8s() -> None:
     log = eval(

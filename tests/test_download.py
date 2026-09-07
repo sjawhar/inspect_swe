@@ -1,14 +1,17 @@
+import asyncio
 import sys
 from pathlib import Path
-from typing import Literal
-from unittest.mock import MagicMock, patch
+from typing import Callable, Literal
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from inspect_swe import (
     cached_agent_binaries,
     download_agent_binary,
     download_wheels_tarball,
 )
+from inspect_swe._util.download import download_file
 
 
 @pytest.mark.slow
@@ -45,6 +48,56 @@ def test_codex_cli_binary_download() -> None:
     assert cached[0].agent == "codex_cli"
     assert cached[0].path.exists()
     assert cached[0].path.stat().st_size > 0
+
+
+def test_opencode_download_routes_to_opencode_source() -> None:
+    # the docs' offline-install path (download_agent_binary("opencode", ...))
+    # must route to the opencode binary source rather than raising ValueError
+    from inspect_swe._tools import download as download_tool
+
+    mock_download = AsyncMock(return_value=(b"", None))
+    with patch.object(download_tool, "download_agent_binary_async", mock_download):
+        download_agent_binary("opencode", "1.14.30", "linux-x64")
+
+    assert mock_download.await_args is not None
+    source, version, platform = mock_download.await_args.args
+    assert source.agent == "opencode"
+    assert version == "1.14.30"
+    assert platform == "linux-x64"
+
+
+def test_cached_agent_binaries_lists_opencode(tmp_path: Path) -> None:
+    from inspect_swe._opencode import agentbinary as opencode_agentbinary
+
+    with patch.object(opencode_agentbinary, "package_cache_dir", return_value=tmp_path):
+        (tmp_path / "opencode-package-1.14.30-linux-x64.tar.gz").write_bytes(b"x")
+        cached = cached_agent_binaries("opencode")
+
+    assert [(b.agent, b.version) for b in cached] == [("opencode", "1.14.30")]
+
+
+def test_cached_agent_binaries_lists_antigravity_cli(tmp_path: Path) -> None:
+    from inspect_swe._antigravity_cli import agentbinary as antigravity_agentbinary
+
+    with patch.object(
+        antigravity_agentbinary, "package_cache_dir", return_value=tmp_path
+    ):
+        source = antigravity_agentbinary.antigravity_cli_binary_source()
+        for version in ("1.1.20", "1.1.27"):
+            source.cached_binary_path(version, "linux-x64").write_bytes(b"binary")
+
+        default_cached = cached_agent_binaries("antigravity_cli")
+        cached = cached_agent_binaries("antigravity_cli", quiet=True)
+
+    assert [(binary.agent, binary.version) for binary in cached] == [
+        ("antigravity_cli", "1.1.27"),
+        ("antigravity_cli", "1.1.20"),
+    ]
+    assert {binary.path.name for binary in cached} == {
+        "agy-1.1.27-linux-x64",
+        "agy-1.1.20-linux-x64",
+    }
+    assert cached == default_cached
 
 
 @pytest.mark.slow
@@ -209,6 +262,81 @@ def test_ensure_pip_available_bootstraps_when_missing() -> None:
             capture_output=True,
             text=True,
         )
+
+
+def _download_with_transport(
+    handler: Callable[[httpx.Request], httpx.Response],
+) -> bytes:
+    """Run download_file against a mock transport with zero retry delays."""
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def client_with_mock_transport(**kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=transport, **kwargs)  # type: ignore[arg-type]
+
+    with (
+        patch("httpx.AsyncClient", client_with_mock_transport),
+        patch("inspect_swe._util.download._RETRY_DELAYS", (0.0, 0.0, 0.0)),
+    ):
+        return asyncio.run(download_file("https://example.com/file"))
+
+
+def test_download_file_retries_transient_errors() -> None:
+    """Transient transport errors (e.g. read timeouts) are retried."""
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise httpx.ReadTimeout("timed out", request=request)
+        return httpx.Response(200, content=b"ok")
+
+    assert _download_with_transport(handler) == b"ok"
+    assert calls == 3
+
+
+def test_download_file_retries_server_errors() -> None:
+    """5xx responses are treated as transient and retried."""
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(503)
+        return httpx.Response(200, content=b"ok")
+
+    assert _download_with_transport(handler) == b"ok"
+    assert calls == 2
+
+
+def test_download_file_does_not_retry_client_errors() -> None:
+    """4xx responses are permanent and raise immediately."""
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(404)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        _download_with_transport(handler)
+    assert calls == 1
+
+
+def test_download_file_raises_after_retries_exhausted() -> None:
+    """The last error is raised once all attempts are used."""
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    with pytest.raises(httpx.ReadTimeout):
+        _download_with_transport(handler)
+    assert calls == 4
 
 
 def test_ensure_pip_available_raises_on_failure() -> None:

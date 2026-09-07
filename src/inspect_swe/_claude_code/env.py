@@ -36,6 +36,10 @@ from .model import ClaudeCodeModels
 #: it block.
 FALSY_ENV_VALUES: Final = frozenset({"0", "false", "no", "off"})
 
+#: Values Claude Code treats as an explicit "true" for boolean env vars
+#: (transcribed from the bundled source alongside ``FALSY_ENV_VALUES``).
+TRUTHY_ENV_VALUES: Final = frozenset({"1", "true", "yes", "on"})
+
 #: Make MCP connection blocking, with a budget that covers a slow sandbox.
 #:
 #: The blocking wait is bounded, so blocking alone is not sufficient on every
@@ -49,36 +53,84 @@ BLOCKING_MCP_ENV: Final = {
     "MCP_CONNECT_TIMEOUT_MS": "300000",
 }
 
+MODEL_IDENTITY_ENV: Final = frozenset(
+    {
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
+    }
+)
+
+#: Turn off Claude Code's auto-memory.
+#:
+#: Auto-memory exists to carry knowledge across *future conversations*: the
+#: agent writes markdown memory files under its config directory and the index
+#: is loaded into context at the start of the next session. A sample's sandbox
+#: normally has no next session -- it starts empty and is destroyed with the
+#: sample -- so the feature cannot pay off here. It still costs: the system
+#: prompt gains an ``# auto memory`` section (~3k input tokens, cached after
+#: the first call) telling the model to persist memory as files with the file
+#: tools, and the model can spend turns doing so. Left on, it also collides
+#: with task-provided memory tooling: in ``examples/mcp`` the model wrote
+#: memory files with ``Write`` instead of calling the ``memory`` MCP server.
+#:
+#: Claude Code reads the variable with a truthy check, so only a
+#: ``TRUTHY_ENV_VALUES`` token disables. An explicit falsy token *enables*,
+#: overriding even ``settings.json``, which gives callers who deliberately
+#: study memory persistence a clean opt-in via ``env``.
+DISABLE_AUTO_MEMORY_ENV: Final = {
+    "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+}
+
 
 def claude_code_agent_env(
     *,
     bridge_port: int,
-    models: ClaudeCodeModels,
+    models: ClaudeCodeModels | None,
     env: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Environment for the Claude Code subprocess.
 
     Args:
         bridge_port: Port of the in-sandbox bridge the agent's API calls go to.
-        models: Resolved presented identities (cosmetic; the bridge routes to
-            the real model).
+        models: Resolved cosmetic identities. Omit only for a dynamic native
+            model resolver, which must not set any static model environment.
         env: Caller overrides, applied last so any default here can be
-            replaced -- including the MCP startup defaults.
+            replaced -- including the MCP startup and auto-memory defaults.
 
     Returns:
         The merged environment, caller values winning on conflict.
     """
+    if models is None:
+        static_model_env = sorted(MODEL_IDENTITY_ENV.intersection(env or {}))
+        if static_model_env:
+            raise ValueError(
+                "Dynamic model resolution cannot combine with static Claude model "
+                f"environment variables: {', '.join(static_model_env)}."
+            )
+
+    model_env = (
+        {}
+        if models is None
+        else {
+            "ANTHROPIC_MODEL": models.presented,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": models.opus,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": models.sonnet,
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": models.haiku,
+            "CLAUDE_CODE_SUBAGENT_MODEL": models.subagent,
+            "ANTHROPIC_SMALL_FAST_MODEL": models.haiku,
+        }
+    )
     return {
         "ANTHROPIC_BASE_URL": f"http://localhost:{bridge_port}",
         "ANTHROPIC_AUTH_TOKEN": "sk-ant-api03-DOq5tyLPrk9M4hPE",
-        "ANTHROPIC_MODEL": models.presented,
-        "ANTHROPIC_DEFAULT_OPUS_MODEL": models.opus,
-        "ANTHROPIC_DEFAULT_SONNET_MODEL": models.sonnet,
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL": models.haiku,
-        "CLAUDE_CODE_SUBAGENT_MODEL": models.subagent,
-        "ANTHROPIC_SMALL_FAST_MODEL": models.haiku,
+        **model_env,
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
         "IS_SANDBOX": "1",
         **BLOCKING_MCP_ENV,
+        **DISABLE_AUTO_MEMORY_ENV,
     } | (env or {})
