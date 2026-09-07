@@ -121,6 +121,16 @@ def test_native_google_factory_uses_google_catalog_and_bare_operator_alias() -> 
     assert isinstance(bashrc, str)
     assert "alias opencode=/opt/opencode" in bashrc
     assert "alias opencode='/opt/opencode run" not in bashrc
+    session = centaur_call["session"]
+    assert isinstance(session, CentaurSession)
+    assert session.invocation == (
+        "/opt/opencode",
+        "run",
+        "--model",
+        "google/gdm-fsm-plum",
+        "--format",
+        "json",
+    )
 
 def test_opencode_exposes_resolver_without_provider_configuration() -> None:
     """Keep bridge routing public without leaking OpenCode provider internals."""
