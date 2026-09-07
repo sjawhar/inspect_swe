@@ -74,6 +74,7 @@ async def run_centaur(
     instructions: str,
     bashrc: str,
     session: CentaurSession,
+    user: str | None = None,
     commands_filter: CommandsFilter | None = None,
 ) -> AgentState:
     """Run one human CLI session and preserve its output on the live bridge state."""
@@ -86,6 +87,7 @@ async def run_centaur(
 
     if session.refresh is not None:
         commands_filter = _commands_filter_with_refresh(commands_filter, session)
+    user = session.user if user is None else user
 
     if commands_filter is not None:
         agent = human_cli(
@@ -94,7 +96,7 @@ async def run_centaur(
             record_session=options.record_session,
             instructions=instructions,
             bashrc=bashrc,
-            user=session.user,
+            user=user,
             commands_filter=commands_filter,
             on_ready=on_ready,
         )
@@ -105,7 +107,7 @@ async def run_centaur(
             record_session=options.record_session,
             instructions=instructions,
             bashrc=bashrc,
-            user=session.user,
+            user=user,
             on_ready=on_ready,
         )
 
