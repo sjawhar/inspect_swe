@@ -1,10 +1,12 @@
 """Tests for the OpenCode agent install/setup utilities."""
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import anyio
+import inspect_swe._opencode.opencode as opencode_module
 import pytest
 from inspect_ai import Task, eval
 from inspect_ai.dataset import Sample
@@ -13,7 +15,7 @@ from inspect_ai.solver import Generate, Solver, TaskState, solver
 from inspect_ai.util import SandboxEnvironment, sandbox
 from inspect_swe._opencode import agentbinary
 from inspect_swe._opencode.agentbinary import ensure_opencode_setup
-from inspect_swe._util.sandbox import SandboxPlatform
+from inspect_swe._util.sandbox import SANDBOX_INSTALL_DIR, SandboxPlatform
 
 from tests.conftest import skip_if_no_docker
 
@@ -250,6 +252,262 @@ def test_ensure_opencode_setup_delegates_to_ensure_agent_binary_installed() -> N
     mock_ensure_installed.assert_awaited_once_with(fake_source, "stable", None, sbox)
     assert binary == "/opt/opencode/opencode"
     assert dependency_bin_dirs == ["/usr/local/bin", "/usr/local/bin"]
+
+
+
+class _ConfigDependencySandbox:
+    """Structural sandbox fake for OpenCode's pre-plugin dependency preparation."""
+
+    def __init__(self, config_states: list[str]) -> None:
+        self.config_states = config_states
+        self.exec_calls: list[tuple[list[str], dict[str, object]]] = []
+        self.written: list[str] = []
+
+    async def exec(
+        self, cmd: list[str], **kwargs: object
+    ) -> SimpleNamespace:
+        self.exec_calls.append((cmd, kwargs))
+        if cmd == ["/opt/opencode", "--version"]:
+            return SimpleNamespace(success=True, stdout="1.18.26\n", stderr="")
+        if cmd[:2] == ["bash", "-c"] and "metadata=0" in cmd[2]:
+            return SimpleNamespace(
+                success=True,
+                stdout=f"{self.config_states.pop(0)}\n",
+                stderr="",
+            )
+        return SimpleNamespace(success=True, stdout="", stderr="")
+
+    async def write_file(self, path: str, data: bytes) -> None:
+        self.written.append(path)
+
+
+class _NativeConfigPathsSandbox:
+    """Structural fake exposing OpenCode ConfigPaths-equivalent locations."""
+
+    def __init__(self) -> None:
+        self.exec_calls: list[list[str]] = []
+
+    async def exec(
+        self, cmd: list[str], **kwargs: object
+    ) -> SimpleNamespace:
+        self.exec_calls.append(cmd)
+        if cmd[0] == "git":
+            return SimpleNamespace(
+                success=True,
+                stdout="/worktree\n",
+                stderr="",
+            )
+        if cmd[3] == "opencode-config-paths":
+            return SimpleNamespace(
+                success=True,
+                stdout="/worktree/src/.opencode\n/worktree/.opencode\n",
+                stderr="",
+            )
+        assert cmd[3] == "opencode-config-home"
+        return SimpleNamespace(
+            success=True,
+            stdout="/home/agent/.opencode\n",
+            stderr="",
+        )
+
+
+def test_supplied_config_seed_prepares_model_free_startup_without_host_bundle() -> None:
+    """A supplied OCI seed is validated and copied before any model/plugin launch."""
+    sandbox = _ConfigDependencySandbox(["empty"])
+    validate = AsyncMock()
+    with (
+        patch.object(agentbinary, "_validate_config_dependency_tree", validate),
+        patch.object(
+            agentbinary,
+            "_local_config_dependency_seed",
+            AsyncMock(side_effect=AssertionError("host cache must not be used")),
+        ),
+    ):
+        anyio.run(
+            agentbinary.seed_opencode_config_dependencies,
+            cast(SandboxEnvironment, sandbox),
+            "/opt/opencode",
+            "/node",
+            ["/node-bin"],
+            ["/home/agent/.config/opencode"],
+            "/opt/agent-cli/opencode/etc/opencode/config-deps",
+            "agent",
+        )
+
+    validate.assert_any_awaited_with(
+        cast(SandboxEnvironment, sandbox),
+        "/node",
+        "/opt/agent-cli/opencode/etc/opencode/config-deps",
+        "1.18.26",
+        "agent",
+    )
+    assert sandbox.exec_calls[0][0] == ["/opt/opencode", "--version"]
+    sandbox_commands = [" ".join(call[0]) for call in sandbox.exec_calls]
+    assert any("cp -a --no-preserve=ownership" in command for command in sandbox_commands)
+    assert all("npm " not in command and "opencode run" not in command for command in sandbox_commands)
+
+
+def test_missing_config_seed_uses_exact_versioned_host_cache_without_sandbox_npm() -> None:
+    """The local companion archive is keyed to the installed CLI version and platform."""
+    sandbox = _ConfigDependencySandbox(["empty"])
+    create_bundle = Mock(return_value=b"config-dependency-tarball")
+    with (
+        patch.object(agentbinary, "_validate_config_dependency_tree", AsyncMock()),
+        patch.object(
+            agentbinary,
+            "detect_sandbox_platform",
+            AsyncMock(return_value="linux-x64"),
+        ),
+        patch.object(agentbinary, "create_npm_bundle", create_bundle),
+    ):
+        anyio.run(
+            agentbinary.seed_opencode_config_dependencies,
+            cast(SandboxEnvironment, sandbox),
+            "/opt/opencode",
+            "/node",
+            ["/node-bin"],
+            ["/home/agent/.config/opencode"],
+            None,
+            "agent",
+        )
+
+    create_bundle.assert_called_once_with(
+        package="@opencode-ai/plugin",
+        version="1.18.26",
+        platform="linux-x64",
+        cache_name="opencode-config-deps",
+        ignore_scripts=True,
+    )
+    assert sandbox.written == [
+        f"{SANDBOX_INSTALL_DIR}/opencode-config-deps-1.18.26-linux-x64.tar.gz"
+    ]
+    sandbox_commands = [" ".join(call[0]) for call in sandbox.exec_calls]
+    assert any("tar -xzf" in command for command in sandbox_commands)
+    assert all("npm " not in command for command in sandbox_commands)
+
+
+def test_complete_user_dependency_metadata_is_validated_without_copying() -> None:
+    """A valid user-owned package tree is preserved instead of overwritten."""
+    sandbox = _ConfigDependencySandbox(["complete"])
+    validate = AsyncMock()
+    with patch.object(agentbinary, "_validate_config_dependency_tree", validate):
+        anyio.run(
+            agentbinary.seed_opencode_config_dependencies,
+            cast(SandboxEnvironment, sandbox),
+            "/opt/opencode",
+            "/node",
+            ["/node-bin"],
+            ["/home/agent/.opencode"],
+            "/opt/agent-cli/opencode/etc/opencode/config-deps",
+            "agent",
+        )
+
+    sandbox_commands = [" ".join(call[0]) for call in sandbox.exec_calls]
+    assert not any("cp -a --no-preserve=ownership" in command for command in sandbox_commands)
+    validate.assert_any_awaited_with(
+        cast(SandboxEnvironment, sandbox),
+        "/node",
+        "/home/agent/.opencode",
+        "1.18.26",
+        "agent",
+    )
+
+
+def test_conflicting_complete_user_dependency_metadata_errors_without_copying() -> None:
+    """A stale plugin version fails rather than replacing the user's package tree."""
+    sandbox = _ConfigDependencySandbox(["complete"])
+    validate = AsyncMock(
+        side_effect=[
+            None,
+            RuntimeError("installed @opencode-ai/plugin is 1.18.25, expected 1.18.26"),
+        ]
+    )
+    with (
+        patch.object(agentbinary, "_validate_config_dependency_tree", validate),
+        pytest.raises(RuntimeError, match="expected 1.18.26"),
+    ):
+        anyio.run(
+            agentbinary.seed_opencode_config_dependencies,
+            cast(SandboxEnvironment, sandbox),
+            "/opt/opencode",
+            "/node",
+            ["/node-bin"],
+            ["/home/agent/.opencode"],
+            "/opt/agent-cli/opencode/etc/opencode/config-deps",
+            "agent",
+        )
+
+    sandbox_commands = [" ".join(call[0]) for call in sandbox.exec_calls]
+    assert not any("cp -a --no-preserve=ownership" in command for command in sandbox_commands)
+
+
+def test_partial_user_dependency_metadata_errors_without_copying() -> None:
+    """A partial user package tree fails loudly instead of being silently replaced."""
+    sandbox = _ConfigDependencySandbox(["partial"])
+    with (
+        patch.object(agentbinary, "_validate_config_dependency_tree", AsyncMock()),
+        pytest.raises(RuntimeError, match="incomplete dependency metadata"),
+    ):
+        anyio.run(
+            agentbinary.seed_opencode_config_dependencies,
+            cast(SandboxEnvironment, sandbox),
+            "/opt/opencode",
+            "/node",
+            ["/node-bin"],
+            ["/home/agent/.opencode"],
+            "/opt/agent-cli/opencode/etc/opencode/config-deps",
+            "agent",
+        )
+
+    sandbox_commands = [" ".join(call[0]) for call in sandbox.exec_calls]
+    assert not any("cp -a --no-preserve=ownership" in command for command in sandbox_commands)
+
+
+def test_native_config_dirs_cover_project_home_and_explicit_config_dir() -> None:
+    """Every ConfigPaths location is provisioned, not only the wrapper global config."""
+    sandbox = _NativeConfigPathsSandbox()
+
+    directories = anyio.run(
+        opencode_module._native_opencode_config_dirs,
+        cast(SandboxEnvironment, sandbox),
+        "/worktree/src/deep",
+        "/home/agent/.config/opencode",
+        "/home/agent",
+        "/mnt/user-config",
+        False,
+        "agent",
+    )
+
+    assert directories == [
+        "/home/agent/.config/opencode",
+        "/worktree/src/.opencode",
+        "/worktree/.opencode",
+        "/home/agent/.opencode",
+        "/mnt/user-config",
+    ]
+
+
+def test_native_config_dirs_respect_project_config_disable_flag() -> None:
+    """The native disable flag leaves global, home, and explicit dirs intact."""
+    sandbox = _NativeConfigPathsSandbox()
+
+    directories = anyio.run(
+        opencode_module._native_opencode_config_dirs,
+        cast(SandboxEnvironment, sandbox),
+        "/worktree/src/deep",
+        "/home/agent/.config/opencode",
+        "/home/agent",
+        "/mnt/user-config",
+        True,
+        "agent",
+    )
+
+    assert directories == [
+        "/home/agent/.config/opencode",
+        "/home/agent/.opencode",
+        "/mnt/user-config",
+    ]
+    assert not any(call[0] == "git" for call in sandbox.exec_calls)
 
 
 @solver
