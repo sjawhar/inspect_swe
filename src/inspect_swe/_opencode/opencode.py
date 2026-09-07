@@ -1,8 +1,9 @@
 import json
+import posixpath
 import shlex
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, Literal, Sequence
+from typing import Any, Literal, NamedTuple, Sequence
 
 from inspect_ai.agent import (
     Agent,
@@ -58,6 +59,29 @@ def _event_identity(event: ModelEvent) -> OpenCodeRequestIdentity | None:
     metadata = event.metadata or {}
     headers = metadata.get(BRIDGE_REQUEST_HEADERS)
     return request_identity(headers) if isinstance(headers, dict) else None
+
+
+class _OpenCodeConfigPaths(NamedTuple):
+    """Separate wrapper-owned bridge state from native configuration inputs."""
+
+    wrapper_dir: str
+    native_home: str
+    native_global_dir: str
+
+
+def _opencode_config_paths(
+    sandbox_home: str, launch_env: dict[str, str]
+) -> _OpenCodeConfigPaths:
+    effective_home = launch_env.get("HOME", sandbox_home)
+    native_home = launch_env.get("OPENCODE_TEST_HOME", effective_home)
+    xdg_config_home = launch_env.get(
+        "XDG_CONFIG_HOME", f"{effective_home}/.config"
+    )
+    return _OpenCodeConfigPaths(
+        wrapper_dir=f"{sandbox_home}/.inspect_swe/opencode",
+        native_home=native_home,
+        native_global_dir=f"{xdg_config_home}/opencode",
+    )
 
 
 async def _native_opencode_config_dirs(
@@ -131,6 +155,8 @@ async def _native_opencode_config_dirs(
         )
     directories.extend(home_result.stdout.splitlines())
     if config_dir:
+        if not config_dir.startswith("/"):
+            config_dir = posixpath.normpath(posixpath.join(agent_cwd, config_dir))
         directories.append(config_dir)
     return list(dict.fromkeys(directories))
 
@@ -285,12 +311,8 @@ def opencode(
             sandbox_home = home_result.stdout.strip() or "/root"
 
             launch_env = env or {}
-            effective_home = launch_env.get("HOME", sandbox_home)
-            native_home = launch_env.get("OPENCODE_TEST_HOME", effective_home)
-            xdg_config_home = launch_env.get(
-                "XDG_CONFIG_HOME", f"{effective_home}/.config"
-            )
-            opencode_config_dir = f"{xdg_config_home}/opencode"
+            config_paths = _opencode_config_paths(sandbox_home, launch_env)
+            opencode_config_dir = config_paths.wrapper_dir
 
             # write opencode config to redirect provider requests to the bridge
             # and (optionally) configure mcp servers.
@@ -356,8 +378,8 @@ def opencode(
             native_config_dirs = await _native_opencode_config_dirs(
                 sbox,
                 agent_cwd,
-                opencode_config_dir,
-                native_home,
+                config_paths.native_global_dir,
+                config_paths.native_home,
                 launch_env.get("OPENCODE_CONFIG_DIR"),
                 launch_env.get("OPENCODE_DISABLE_PROJECT_CONFIG", "").lower()
                 in {"true", "1"},

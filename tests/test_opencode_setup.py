@@ -1,6 +1,8 @@
 """Tests for the OpenCode agent install/setup utilities."""
 
 import importlib
+import os
+import subprocess
 
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,9 +15,9 @@ from inspect_ai import Task, eval
 from inspect_ai.dataset import Sample
 from inspect_ai.scorer import Score, Scorer, Target, scorer
 from inspect_ai.solver import Generate, Solver, TaskState, solver
-from inspect_ai.util import SandboxEnvironment, sandbox
 from inspect_swe._opencode import agentbinary
 from inspect_swe._opencode.agentbinary import ensure_opencode_setup
+from inspect_swe._util import node as node_util
 from inspect_swe._util.sandbox import SANDBOX_INSTALL_DIR, SandboxPlatform
 
 from tests.conftest import skip_if_no_docker
@@ -259,8 +261,16 @@ def test_ensure_opencode_setup_delegates_to_ensure_agent_binary_installed() -> N
 class _ConfigDependencySandbox:
     """Structural sandbox fake for OpenCode's pre-plugin dependency preparation."""
 
-    def __init__(self, config_states: list[str]) -> None:
+    def __init__(
+        self,
+        config_states: list[str],
+        *,
+        writability: list[str] | None = None,
+        preparation_states: list[str] | None = None,
+    ) -> None:
         self.config_states = config_states
+        self.writability = writability or ["writable"]
+        self.preparation_states = preparation_states or ["absent"]
         self.exec_calls: list[tuple[list[str], dict[str, object]]] = []
         self.written: list[str] = []
 
@@ -270,6 +280,24 @@ class _ConfigDependencySandbox:
         self.exec_calls.append((cmd, kwargs))
         if cmd == ["/opt/opencode", "--version"]:
             return SimpleNamespace(success=True, stdout="1.18.26\n", stderr="")
+        if (
+            cmd[:2] == ["bash", "-c"]
+            and "opencode-config-dependency-writable" in cmd[2]
+        ):
+            return SimpleNamespace(
+                success=True,
+                stdout=f"{self.writability.pop(0)}\n",
+                stderr="",
+            )
+        if (
+            cmd[:2] == ["bash", "-c"]
+            and "opencode-config-dependency-preparation" in cmd[2]
+        ):
+            return SimpleNamespace(
+                success=True,
+                stdout=f"{self.preparation_states.pop(0)}\n",
+                stderr="",
+            )
         if cmd[:2] == ["bash", "-c"] and "metadata=0" in cmd[2]:
             return SimpleNamespace(
                 success=True,
@@ -352,8 +380,9 @@ def test_missing_config_seed_uses_exact_versioned_host_cache_without_sandbox_npm
     """The local companion archive is keyed to the installed CLI version and platform."""
     sandbox = _ConfigDependencySandbox(["empty"])
     create_bundle = Mock(return_value=b"config-dependency-tarball")
+    validate = AsyncMock()
     with (
-        patch.object(agentbinary, "_validate_config_dependency_tree", AsyncMock()),
+        patch.object(agentbinary, "_validate_config_dependency_tree", validate),
         patch.object(
             agentbinary,
             "detect_sandbox_platform",
@@ -382,6 +411,13 @@ def test_missing_config_seed_uses_exact_versioned_host_cache_without_sandbox_npm
     assert sandbox.written == [
         f"{SANDBOX_INSTALL_DIR}/opencode-config-deps-1.18.26-linux-x64.tar.gz"
     ]
+    validate.assert_any_await(
+        cast(SandboxEnvironment, sandbox),
+        "/node",
+        f"{SANDBOX_INSTALL_DIR}/opencode-config-deps-1.18.26-linux-x64.staging",
+        "1.18.26",
+        "root",
+    )
     sandbox_commands = [" ".join(call[0]) for call in sandbox.exec_calls]
     assert any("tar -xzf" in command for command in sandbox_commands)
     assert all("npm " not in command for command in sandbox_commands)
@@ -442,6 +478,214 @@ def test_conflicting_complete_user_dependency_metadata_errors_without_copying() 
     assert not any("cp -a --no-preserve=ownership" in command for command in sandbox_commands)
 
 
+
+
+def test_config_dependency_validator_rejects_stale_transitive_package(
+    tmp_path: Path,
+) -> None:
+    """A lockfile closure is rejected when any installed package has a stale version."""
+    seed_dir = tmp_path / "config-deps"
+    plugin_dir = seed_dir / "node_modules" / "@opencode-ai" / "plugin"
+    stale_dir = seed_dir / "node_modules" / "stale-transitive"
+    plugin_dir.mkdir(parents=True)
+    stale_dir.mkdir()
+    (seed_dir / "package.json").write_text(
+        '{"dependencies":{"@opencode-ai/plugin":"1.18.26"}}',
+        encoding="utf-8",
+    )
+    (seed_dir / "package-lock.json").write_text(
+        """\
+{
+  "lockfileVersion": 3,
+  "packages": {
+    "": {"dependencies": {"@opencode-ai/plugin": "1.18.26"}},
+    "node_modules/@opencode-ai/plugin": {"version": "1.18.26"},
+    "node_modules/stale-transitive": {"version": "2.0.0"}
+  }
+}
+""",
+        encoding="utf-8",
+    )
+    (plugin_dir / "package.json").write_text(
+        '{"version":"1.18.26"}', encoding="utf-8"
+    )
+    (stale_dir / "package.json").write_text(
+        '{"version":"1.0.0"}', encoding="utf-8"
+    )
+
+    result = subprocess.run(
+        [
+            "node",
+            "-e",
+            agentbinary._CONFIG_DEPENDENCY_VALIDATION,
+            str(seed_dir),
+            "1.18.26",
+            "linux-x64",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "stale-transitive is 1.0.0, expected 2.0.0" in result.stderr
+
+
+def test_config_dependency_validator_skips_foreign_optional_lock_package(
+    tmp_path: Path,
+) -> None:
+    """A Linux seed need not contain a darwin-arm64 optional lock package."""
+    seed_dir = tmp_path / "config-deps"
+    plugin_dir = seed_dir / "node_modules" / "@opencode-ai" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    (seed_dir / "package.json").write_text(
+        '{"dependencies":{"@opencode-ai/plugin":"1.18.26"}}',
+        encoding="utf-8",
+    )
+    (seed_dir / "package-lock.json").write_text(
+        """\
+{
+  "lockfileVersion": 3,
+  "packages": {
+    "": {"dependencies": {"@opencode-ai/plugin": "1.18.26"}},
+    "node_modules/@opencode-ai/plugin": {"version": "1.18.26"},
+    "node_modules/darwin-arm64": {
+      "version": "3.0.0",
+      "optional": true,
+      "os": ["darwin"],
+      "cpu": ["arm64"]
+    }
+  }
+}
+""",
+        encoding="utf-8",
+    )
+    (plugin_dir / "package.json").write_text(
+        '{"version":"1.18.26"}', encoding="utf-8"
+    )
+
+    result = subprocess.run(
+        [
+            "node",
+            "-e",
+            agentbinary._CONFIG_DEPENDENCY_VALIDATION,
+            str(seed_dir),
+            "1.18.26",
+            "linux-x64",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+
+
+def test_config_dependency_validator_rejects_missing_applicable_optional_package(
+    tmp_path: Path,
+) -> None:
+    """An optional package for the active Linux x64 platform remains required."""
+    seed_dir = tmp_path / "config-deps"
+    plugin_dir = seed_dir / "node_modules" / "@opencode-ai" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    (seed_dir / "package.json").write_text(
+        '{"dependencies":{"@opencode-ai/plugin":"1.18.26"}}',
+        encoding="utf-8",
+    )
+    (seed_dir / "package-lock.json").write_text(
+        """\
+{
+  "lockfileVersion": 3,
+  "packages": {
+    "": {"dependencies": {"@opencode-ai/plugin": "1.18.26"}},
+    "node_modules/@opencode-ai/plugin": {"version": "1.18.26"},
+    "node_modules/linux-x64": {
+      "version": "3.0.0",
+      "optional": true,
+      "os": ["linux"],
+      "cpu": ["x64"]
+    }
+  }
+}
+""",
+        encoding="utf-8",
+    )
+    (plugin_dir / "package.json").write_text(
+        '{"version":"1.18.26"}', encoding="utf-8"
+    )
+
+    result = subprocess.run(
+        [
+            "node",
+            "-e",
+            agentbinary._CONFIG_DEPENDENCY_VALIDATION,
+            str(seed_dir),
+            "1.18.26",
+            "linux-x64",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "missing installed package metadata for node_modules/linux-x64" in result.stderr
+
+
+def test_read_only_config_dir_is_left_for_native_opencode() -> None:
+    """A native read-only config directory remains untouched."""
+    sandbox = _ConfigDependencySandbox(["empty"], writability=["read-only"])
+    validate = AsyncMock()
+    with patch.object(agentbinary, "_validate_config_dependency_tree", validate):
+        anyio.run(
+            agentbinary.seed_opencode_config_dependencies,
+            cast(SandboxEnvironment, sandbox),
+            "/opt/opencode",
+            "/node",
+            ["/node-bin"],
+            ["/worktree/.opencode"],
+            "/opt/agent-cli/opencode/etc/opencode/config-deps",
+            "agent",
+        )
+
+    sandbox_commands = [" ".join(call[0]) for call in sandbox.exec_calls]
+    assert not any("metadata=0" in command for command in sandbox_commands)
+    assert not any("cp -a --no-preserve=ownership" in command for command in sandbox_commands)
+    validate.assert_awaited_once_with(
+        cast(SandboxEnvironment, sandbox),
+        "/node",
+        "/opt/agent-cli/opencode/etc/opencode/config-deps",
+        "1.18.26",
+        "agent",
+    )
+
+
+def test_interrupted_hook_owned_preparation_recovers_on_retry() -> None:
+    """Only a hook-marked partial closure is discarded and seeded again."""
+    sandbox = _ConfigDependencySandbox(
+        ["partial", "empty"],
+        preparation_states=["present"],
+    )
+    with patch.object(agentbinary, "_validate_config_dependency_tree", AsyncMock()):
+        anyio.run(
+            agentbinary.seed_opencode_config_dependencies,
+            cast(SandboxEnvironment, sandbox),
+            "/opt/opencode",
+            "/node",
+            ["/node-bin"],
+            ["/worktree/.opencode"],
+            "/opt/agent-cli/opencode/etc/opencode/config-deps",
+            "agent",
+        )
+
+    sandbox_commands = [" ".join(call[0]) for call in sandbox.exec_calls]
+    assert any(
+        "inspect-swe-opencode-deps-1.18.26.preparing" in command
+        and "rm -f" in command
+        for command in sandbox_commands
+    )
+    assert any("cp -a --no-preserve=ownership" in command for command in sandbox_commands)
+
 def test_partial_user_dependency_metadata_errors_without_copying() -> None:
     """A partial user package tree fails loudly instead of being silently replaced."""
     sandbox = _ConfigDependencySandbox(["partial"])
@@ -489,6 +733,43 @@ def test_native_config_dirs_cover_project_home_and_explicit_config_dir() -> None
     ]
 
 
+def test_native_config_dirs_resolve_relative_explicit_dir_from_agent_cwd() -> None:
+    """A relative OPENCODE_CONFIG_DIR is seeded where native OpenCode resolves it."""
+    sandbox = _NativeConfigPathsSandbox()
+    module = importlib.import_module("inspect_swe._opencode.opencode")
+
+    directories = anyio.run(
+        module._native_opencode_config_dirs,
+        cast(SandboxEnvironment, sandbox),
+        "/worktree/src/deep",
+        "/home/agent/.config/opencode",
+        "/home/agent",
+        ".opencode-user",
+        False,
+        "agent",
+    )
+
+    assert directories[-1] == "/worktree/src/deep/.opencode-user"
+
+
+def test_opencode_config_paths_keep_bridge_config_out_of_user_global_dir() -> None:
+    """The bridge writes only its wrapper config while native paths retain overrides."""
+    module = importlib.import_module("inspect_swe._opencode.opencode")
+
+    paths = module._opencode_config_paths(
+        "/sandbox/home",
+        {
+            "HOME": "/user/home",
+            "OPENCODE_TEST_HOME": "/test/home",
+            "XDG_CONFIG_HOME": "/user/xdg",
+        },
+    )
+
+    assert paths.wrapper_dir == "/sandbox/home/.inspect_swe/opencode"
+    assert paths.native_home == "/test/home"
+    assert paths.native_global_dir == "/user/xdg/opencode"
+
+
 def test_native_config_dirs_respect_project_config_disable_flag() -> None:
     """The native disable flag leaves global, home, and explicit dirs intact."""
     sandbox = _NativeConfigPathsSandbox()
@@ -510,6 +791,82 @@ def test_native_config_dirs_respect_project_config_disable_flag() -> None:
         "/mnt/user-config",
     ]
     assert not any(call[0] == "git" for call in sandbox.exec_calls)
+
+
+def test_npm_bundle_publishes_cache_atomically(tmp_path: Path) -> None:
+    """A cache entry becomes visible only after its complete archive is ready."""
+
+    def fake_npm_install(
+        _command: list[str], *, cwd: str, **_kwargs: object
+    ) -> SimpleNamespace:
+        package_dir = Path(cwd) / "node_modules" / "@opencode-ai" / "plugin"
+        package_dir.mkdir(parents=True)
+        (package_dir / "package.json").write_text(
+            '{"version":"1.18.26"}', encoding="utf-8"
+        )
+        (Path(cwd) / "package-lock.json").write_text(
+            '{"lockfileVersion":3}', encoding="utf-8"
+        )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    replace = Mock(wraps=os.replace)
+    with (
+        patch.object(node_util, "package_cache_dir", return_value=tmp_path),
+        patch.object(node_util.shutil, "which", return_value="/usr/bin/npm"),
+        patch.object(node_util.subprocess, "run", fake_npm_install),
+        patch.object(node_util.os, "replace", replace),
+    ):
+        bundle = node_util.create_npm_bundle(
+            package="@opencode-ai/plugin",
+            version="1.18.26",
+            platform="linux-x64",
+            cache_name="opencode-config-deps",
+            ignore_scripts=True,
+        )
+
+    cache_path = (
+        tmp_path / "opencode-config-deps-1.18.26-linux-x64-noscripts.tar.gz"
+    )
+    replace.assert_called_once()
+    assert replace.call_args.args[1] == cache_path
+    assert cache_path.read_bytes() == bundle
+
+
+def test_npm_bundle_rebuilds_an_interrupted_cache_entry(tmp_path: Path) -> None:
+    """An unreadable cache artifact is replaced rather than becoming a permanent hit."""
+    cache_path = (
+        tmp_path / "opencode-config-deps-1.18.26-linux-x64-noscripts.tar.gz"
+    )
+    cache_path.write_bytes(b"interrupted archive")
+
+    def fake_npm_install(
+        _command: list[str], *, cwd: str, **_kwargs: object
+    ) -> SimpleNamespace:
+        package_dir = Path(cwd) / "node_modules" / "@opencode-ai" / "plugin"
+        package_dir.mkdir(parents=True)
+        (package_dir / "package.json").write_text(
+            '{"version":"1.18.26"}', encoding="utf-8"
+        )
+        (Path(cwd) / "package-lock.json").write_text(
+            '{"lockfileVersion":3}', encoding="utf-8"
+        )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with (
+        patch.object(node_util, "package_cache_dir", return_value=tmp_path),
+        patch.object(node_util.shutil, "which", return_value="/usr/bin/npm"),
+        patch.object(node_util.subprocess, "run", fake_npm_install),
+    ):
+        bundle = node_util.create_npm_bundle(
+            package="@opencode-ai/plugin",
+            version="1.18.26",
+            platform="linux-x64",
+            cache_name="opencode-config-deps",
+            ignore_scripts=True,
+        )
+
+    assert bundle != b"interrupted archive"
+    assert cache_path.read_bytes() == bundle
 
 
 @solver

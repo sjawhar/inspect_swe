@@ -177,7 +177,7 @@ _CONFIG_DEPENDENCY_CACHE_NAME = "opencode-config-deps"
 _CONFIG_DEPENDENCY_VALIDATION = r"""
 const fs = require("node:fs");
 const path = require("node:path");
-const [directory, expectedVersion] = process.argv.slice(1);
+const [directory, expectedVersion, targetPlatform = `${process.platform}-${process.arch}`] = process.argv.slice(1);
 
 function fail(message) {
   console.error(message);
@@ -207,13 +207,40 @@ const plugin = readJson("node_modules/@opencode-ai/plugin/package.json");
 if (plugin.version !== expectedVersion) {
   fail(`installed @opencode-ai/plugin is ${plugin.version}, expected ${expectedVersion}`);
 }
+const [targetOs, targetCpu] = targetPlatform.split("-");
+if (!targetOs || !targetCpu) fail(`invalid target platform ${targetPlatform}`);
+
+function selectorIncludesTarget(selectors, target) {
+  if (!Array.isArray(selectors)) return true;
+  const values = selectors.filter((value) => typeof value === "string");
+  const positives = values.filter((value) => !value.startsWith("!"));
+  return !values.includes(`!${target}`) &&
+    (positives.length === 0 || positives.includes(target));
+}
+
+function appliesToTarget(record) {
+  return selectorIncludesTarget(record.os, targetOs) &&
+    selectorIncludesTarget(record.cpu, targetCpu);
+}
+
 const packagePaths = Object.keys(packageLock.packages || {}).filter((entry) =>
   entry.startsWith("node_modules/"),
 );
 if (packagePaths.length === 0) fail("package-lock.json has no installed production closure");
 for (const packagePath of packagePaths) {
-  if (!fs.existsSync(path.join(directory, packagePath, "package.json"))) {
+  const expected = packageLock.packages[packagePath];
+  if (!expected || typeof expected.version !== "string") {
+    fail(`package-lock.json has no version for ${packagePath}`);
+  }
+  const installedPackage = path.join(directory, packagePath, "package.json");
+  if (!fs.existsSync(installedPackage)) {
+    if (expected.optional === true && !appliesToTarget(expected)) continue;
     fail(`missing installed package metadata for ${packagePath}`);
+  }
+  if (!appliesToTarget(expected)) continue;
+  const installed = readJson(`${packagePath}/package.json`);
+  if (installed.version !== expected.version) {
+    fail(`installed ${packagePath} is ${installed.version}, expected ${expected.version}`);
   }
 }
 """
@@ -241,45 +268,44 @@ async def seed_opencode_config_dependencies(
     else:
         platform = await detect_sandbox_platform(sandbox)
         seed_dir = await _local_config_dependency_seed(
-            sandbox, cli_version, platform, user
+            sandbox, node_binary, cli_version, platform, user
         )
 
     await _validate_config_dependency_tree(
         sandbox, node_binary, seed_dir, cli_version, user
     )
     for config_dir in dict.fromkeys(config_dirs):
+        if not await _config_dependency_writable(sandbox, config_dir, user):
+            continue
+
         state = await _config_dependency_state(sandbox, config_dir, user)
         if state == "partial":
-            raise RuntimeError(
-                "OpenCode config directory "
-                f"{config_dir!r} has incomplete dependency metadata; refusing "
-                "to overwrite it"
+            if not await _hook_owned_config_preparation(
+                sandbox, config_dir, cli_version, user
+            ):
+                raise RuntimeError(
+                    "OpenCode config directory "
+                    f"{config_dir!r} has incomplete dependency metadata; refusing "
+                    "to overwrite it"
+                )
+            await _recover_hook_owned_config_preparation(
+                sandbox, config_dir, cli_version, user
             )
+            state = await _config_dependency_state(sandbox, config_dir, user)
+            if state != "empty":
+                raise RuntimeError(
+                    "Unable to recover interrupted OpenCode config dependency "
+                    f"preparation in {config_dir!r}"
+                )
+
         if state == "complete":
             await _validate_config_dependency_tree(
                 sandbox, node_binary, config_dir, cli_version, user
             )
             continue
 
-        quoted_source = shlex.quote(seed_dir)
-        quoted_target = shlex.quote(config_dir)
-        result = await sandbox.exec(
-            bash_command(
-                f"mkdir -p {quoted_target} && "
-                f"cp -a --no-preserve=ownership "
-                f"{quoted_source}/package.json "
-                f"{quoted_source}/package-lock.json "
-                f"{quoted_source}/node_modules {quoted_target}/"
-            ),
-            user=user,
-        )
-        if not result.success:
-            raise RuntimeError(
-                f"Unable to seed OpenCode config dependencies in {config_dir!r}: "
-                f"{result.stderr}"
-            )
-        await _validate_config_dependency_tree(
-            sandbox, node_binary, config_dir, cli_version, user
+        await _stage_config_dependency_tree(
+            sandbox, node_binary, seed_dir, config_dir, cli_version, user
         )
 
 
@@ -309,11 +335,14 @@ async def _opencode_cli_version(
 
 async def _local_config_dependency_seed(
     sandbox: SandboxEnvironment,
+    node_binary: str,
     cli_version: str,
     platform: SandboxPlatform,
     user: str | None,
 ) -> str:
     seed_dir = f"{SANDBOX_INSTALL_DIR}/opencode-config-deps-{cli_version}-{platform}"
+    staging_dir = f"{seed_dir}.staging"
+    archive_path = f"{seed_dir}.tar.gz"
     async with concurrency(
         f"opencode-config-deps-{cli_version}-{platform}", 1, visible=False
     ):
@@ -324,13 +353,12 @@ async def _local_config_dependency_seed(
             cache_name=_CONFIG_DEPENDENCY_CACHE_NAME,
             ignore_scripts=True,
         )
-        archive_path = f"{seed_dir}.tar.gz"
         await sandbox.write_file(archive_path, bundle_data)
         result = await sandbox.exec(
             bash_command(
-                f"mkdir -p {shlex.quote(seed_dir)} && "
-                f"tar -xzf {shlex.quote(archive_path)} -C {shlex.quote(seed_dir)} && "
-                f"rm -f {shlex.quote(archive_path)}"
+                f"rm -rf -- {shlex.quote(staging_dir)} && "
+                f"mkdir -p {shlex.quote(staging_dir)} && "
+                f"tar -xzf {shlex.quote(archive_path)} -C {shlex.quote(staging_dir)}"
             ),
             user="root",
         )
@@ -339,8 +367,176 @@ async def _local_config_dependency_seed(
                 "Unable to extract the local OpenCode config dependency seed: "
                 f"{result.stderr}"
             )
+        await _validate_config_dependency_tree(
+            sandbox, node_binary, staging_dir, cli_version, "root"
+        )
+        result = await sandbox.exec(
+            bash_command(
+                f"rm -rf -- {shlex.quote(seed_dir)} && "
+                f"mv {shlex.quote(staging_dir)} {shlex.quote(seed_dir)} && "
+                f"rm -f {shlex.quote(archive_path)}"
+            ),
+            user="root",
+        )
+        if not result.success:
+            raise RuntimeError(
+                "Unable to promote the local OpenCode config dependency seed: "
+                f"{result.stderr}"
+            )
     return seed_dir
 
+
+
+def _config_dependency_staging_dir(config_dir: str, cli_version: str) -> str:
+    return f"{config_dir}.inspect-swe-opencode-deps-{cli_version}.staging"
+
+
+def _config_dependency_preparation_contents(cli_version: str) -> str:
+    return f"inspect-swe-opencode-deps:{cli_version}"
+
+
+def _config_dependency_preparation_marker(config_dir: str, cli_version: str) -> str:
+    return f"{config_dir}/.inspect-swe-opencode-deps-{cli_version}.preparing"
+
+
+async def _config_dependency_writable(
+    sandbox: SandboxEnvironment, config_dir: str, user: str | None
+) -> bool:
+    quoted_dir = shlex.quote(config_dir)
+    result = await sandbox.exec(
+        bash_command(
+            "# opencode-config-dependency-writable\n"
+            f"target={quoted_dir}; "
+            'if [ -e "$target" ]; then '
+            'if [ -d "$target" ] && [ -w "$target" ]; then echo writable; '
+            "else echo read-only; fi; "
+            "else "
+            'parent="$(dirname "$target")"; '
+            'while [ ! -e "$parent" ]; do '
+            'next="$(dirname "$parent")"; '
+            '[ "$next" = "$parent" ] && break; '
+            'parent="$next"; '
+            "done; "
+            'if [ -d "$parent" ] && [ -w "$parent" ]; then echo writable; '
+            "else echo read-only; fi; "
+            "fi"
+        ),
+        user=user,
+    )
+    state = result.stdout.strip()
+    if not result.success or state not in {"writable", "read-only"}:
+        raise RuntimeError(
+            f"Unable to inspect OpenCode config directory permissions in {config_dir!r}: "
+            f"{result.stderr}"
+        )
+    return state == "writable"
+
+
+async def _hook_owned_config_preparation(
+    sandbox: SandboxEnvironment,
+    config_dir: str,
+    cli_version: str,
+    user: str | None,
+) -> bool:
+    marker = shlex.quote(_config_dependency_preparation_marker(config_dir, cli_version))
+    expected_contents = shlex.quote(
+        _config_dependency_preparation_contents(cli_version)
+    )
+    result = await sandbox.exec(
+        bash_command(
+            "# opencode-config-dependency-preparation\n"
+            f"[ -f {marker} ] && "
+            f"[ \"$(cat {marker})\" = {expected_contents} ] && "
+            "echo present || echo absent"
+        ),
+        user=user,
+    )
+    state = result.stdout.strip()
+    if not result.success or state not in {"present", "absent"}:
+        raise RuntimeError(
+            "Unable to inspect interrupted OpenCode config dependency preparation "
+            f"in {config_dir!r}: {result.stderr}"
+        )
+    return state == "present"
+
+
+async def _recover_hook_owned_config_preparation(
+    sandbox: SandboxEnvironment,
+    config_dir: str,
+    cli_version: str,
+    user: str | None,
+) -> None:
+    target = shlex.quote(config_dir)
+    marker = shlex.quote(_config_dependency_preparation_marker(config_dir, cli_version))
+    staging = shlex.quote(_config_dependency_staging_dir(config_dir, cli_version))
+    result = await sandbox.exec(
+        bash_command(
+            f"rm -f -- {target}/package.json {target}/package-lock.json {marker} && "
+            f"rm -rf -- {target}/node_modules {staging}"
+        ),
+        user=user,
+    )
+    if not result.success:
+        raise RuntimeError(
+            "Unable to recover interrupted OpenCode config dependency preparation "
+            f"in {config_dir!r}: {result.stderr}"
+        )
+
+
+async def _stage_config_dependency_tree(
+    sandbox: SandboxEnvironment,
+    node_binary: str,
+    seed_dir: str,
+    config_dir: str,
+    cli_version: str,
+    user: str | None,
+) -> None:
+    source = shlex.quote(seed_dir)
+    target = shlex.quote(config_dir)
+    staging_dir = _config_dependency_staging_dir(config_dir, cli_version)
+    staging = shlex.quote(staging_dir)
+    marker = shlex.quote(_config_dependency_preparation_marker(config_dir, cli_version))
+    marker_contents = shlex.quote(
+        _config_dependency_preparation_contents(cli_version)
+    )
+    result = await sandbox.exec(
+        bash_command(
+            f"rm -rf -- {staging} && "
+            f"mkdir -p {target} {staging} && "
+            f"cp -a --no-preserve=ownership "
+            f"{source}/package.json "
+            f"{source}/package-lock.json "
+            f"{source}/node_modules {staging}/"
+        ),
+        user=user,
+    )
+    if not result.success:
+        raise RuntimeError(
+            f"Unable to stage OpenCode config dependencies in {config_dir!r}: "
+            f"{result.stderr}"
+        )
+    await _validate_config_dependency_tree(
+        sandbox, node_binary, staging_dir, cli_version, user
+    )
+    result = await sandbox.exec(
+        bash_command(
+            f"printf '%s\\n' {marker_contents} > {marker} && "
+            f"mv {staging}/package.json {target}/package.json && "
+            f"mv {staging}/package-lock.json {target}/package-lock.json && "
+            f"mv {staging}/node_modules {target}/node_modules && "
+            f"rmdir {staging} && "
+            f"rm -f -- {marker}"
+        ),
+        user=user,
+    )
+    if not result.success:
+        raise RuntimeError(
+            f"Unable to promote OpenCode config dependencies in {config_dir!r}: "
+            f"{result.stderr}"
+        )
+    await _validate_config_dependency_tree(
+        sandbox, node_binary, config_dir, cli_version, user
+    )
 
 async def _config_dependency_state(
     sandbox: SandboxEnvironment, config_dir: str, user: str | None
