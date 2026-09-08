@@ -14,7 +14,7 @@ from inspect_ai.agent import (
     agent_with,
     sandbox_agent_bridge,
 )
-from inspect_ai.model import ChatMessageSystem, GenerateFilter, Model
+from inspect_ai.model import ChatMessageSystem, GenerateFilter, Model, ModelResolver
 from inspect_ai.scorer import score
 from inspect_ai.tool import MCPServerConfig, Skill, install_skills, read_skills
 from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
@@ -24,7 +24,7 @@ from inspect_ai.util._sandbox import ExecRemoteAwaitableOptions
 
 from .._util._async import is_callable_coroutine
 from .._util.agentbinary import ensure_agent_binary_installed
-from .._util.centaur import CentaurOptions, run_centaur
+from .._util.centaur import CentaurOptions, CentaurSession, CommandsFilter, run_centaur
 from .._util.mcp_ready import DEFAULT_MCP_READY_TIMEOUT, wait_for_mcp_endpoints
 from .._util.messages import build_user_prompt
 from .._util.path import join_path
@@ -71,6 +71,10 @@ def antigravity_cli(
     sandbox: str | None = None,
     version: Literal["auto", "sandbox", "stable", "latest"] | str = "auto",
     debug: bool | None = None,
+    *,
+    commands_filter: CommandsFilter | None = None,
+    model_resolver: ModelResolver | None = None,
+    accumulate_conversations: bool = False,
 ) -> Agent:
     """Antigravity CLI agent.
 
@@ -100,6 +104,8 @@ def antigravity_cli(
         mcp_ready_timeout: Seconds to wait for bridged MCP endpoints to serve
             tools before the agent launch errors.
         centaur: Run in 'centaur' mode, which makes the Antigravity CLI available to an Inspect `human_cli()` agent rather than running it unattended.
+        commands_filter: In centaur mode only, filter or augment the human agent's
+            command list (e.g. to add task-specific commands). Ignored outside centaur mode.
         attempts: Configure agent to make multiple attempts
         model: Model name to use for inspect bridge (defaults to main model for task)
         model_aliases: Optional mapping of model names to Model instances or model name strings.
@@ -123,6 +129,11 @@ def antigravity_cli(
             - "stable"/"latest": Download and use the latest version
             - "x.x.x": Download and use a specific version
         debug: Trace all debug output.
+        model_resolver: Dynamic bridge routing policy called after `model_aliases`
+            and before the fallback `model`. Return a model/spec to route, or
+            `None` to defer.
+        accumulate_conversations: Keep every bridge conversation in
+            `state.messages` rather than only the main agent loop.
     """
     # resolve centaur
     if centaur is True:
@@ -152,6 +163,8 @@ def antigravity_cli(
             retry_refusals=retry_refusals,
             port=port,
             bridged_tools=bridged_tools,
+            model_resolver=model_resolver,
+            accumulate_conversations=accumulate_conversations,
         ) as bridge:
             # resolve sandbox
             sbox = sandbox_env(sandbox)
@@ -261,11 +274,21 @@ def antigravity_cli(
                 )
 
             if centaur:
-                await _run_antigravity_cli_centaur(
+                return await _run_antigravity_cli_centaur(
                     options=centaur,
                     agy_cmd=cmd,
                     agent_env=agent_env,
-                    state=state,
+                    session=CentaurSession(
+                        state=bridge.state,
+                        invocation=tuple(cmd),
+                        environment=agent_env,
+                        cwd=agent_cwd,
+                        user=user,
+                        sandbox=sbox,
+                        bridge_port=bridge.port,
+                        session_id=None,
+                    ),
+                    commands_filter=commands_filter,
                 )
             else:
                 debug_output: list[str] = []
@@ -440,8 +463,9 @@ async def _run_antigravity_cli_centaur(
     options: CentaurOptions,
     agy_cmd: list[str],
     agent_env: dict[str, str],
-    state: AgentState,
-) -> None:
+    session: CentaurSession,
+    commands_filter: CommandsFilter | None = None,
+) -> AgentState:
     instructions = (
         "Antigravity CLI:\n\n"
         " - You may also use the Antigravity CLI via the 'agy' command.\n"
@@ -453,6 +477,10 @@ async def _run_antigravity_cli_centaur(
     agent_env_vars = [f'export {k}="{v}"' for k, v in centaur_env.items()]
     alias_cmd = shlex.join(agy_cmd)
     alias_cmd = "alias agy='" + alias_cmd.replace("'", "'\\''") + "'"
-    bashrc = "\n".join(agent_env_vars + ["", alias_cmd])
+    bashrc = "\n".join(
+        agent_env_vars + ["", alias_cmd, f"cd -- {shlex.quote(session.cwd)}"]
+    )
 
-    await run_centaur(options, instructions, bashrc, state)
+    return await run_centaur(
+        options, instructions, bashrc, session, commands_filter=commands_filter
+    )
