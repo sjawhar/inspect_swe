@@ -815,6 +815,69 @@ def test_centaur_launch_withholds_the_print_mode_flags() -> None:
     assert "--model" in cmd, cmd
 
 
+@skip_if_no_docker
+@pytest.mark.slow
+def test_centaur_provisions_native_onboarding_and_workspace_trust() -> None:
+    """A new sandbox reaches the human prompt without native setup questions."""
+    handed: list[CentaurSession] = []
+    launches: list[_CaptureLaunch] = []
+
+    async def capture_centaur(
+        *,
+        options: CentaurOptions,
+        agy_cmd: list[str],
+        agent_env: dict[str, str],
+        session: CentaurSession,
+        commands_filter: CommandsFilter | None = None,
+    ) -> AgentState:
+        assert isinstance(options, CentaurOptions)
+        assert session.invocation == tuple(agy_cmd)
+        assert session.environment is agent_env
+        assert commands_filter is None
+        handed.append(session)
+        return session.state
+
+    def capture_sandbox(name: str | None = None) -> Any:
+        captured = _CaptureLaunch(sandbox(name))
+        launches.append(captured)
+        return captured
+
+    with (
+        patch.object(agy_module, "sandbox_env", capture_sandbox),
+        patch.object(agy_module, "_run_antigravity_cli_centaur", capture_centaur),
+    ):
+        logs = eval(_launch_task(centaur=True), model=_MODEL, limit=1, time_limit=300)
+
+    assert logs[0].status == "success", f"CLI run failed: {logs[0].error}"
+    assert len(launches) == 1
+    assert len(handed) == 1
+
+    session = handed[0]
+    settings = _settings_written(launches[0])
+    # Trust exactly the resolved workspace. A wildcard would give the human
+    # terminal more trust than the native CLI needs to skip its first-run gate.
+    assert session.cwd == _FIXTURE_DIR, session.cwd
+    assert settings["trustedWorkspaces"] == [session.cwd]
+    # The CLI's defaults remain its interactive approval policy.
+    assert "toolPermission" not in settings
+    assert "artifactReviewPolicy" not in settings
+    assert settings["enableTelemetry"] is False
+
+    onboarding_paths = [
+        path
+        for path in launches[0].written
+        if path.endswith(".gemini/antigravity-cli/cache/onboarding.json")
+    ]
+    assert len(onboarding_paths) == 1, sorted(launches[0].written)
+    assert json.loads(launches[0].written[onboarding_paths[0]]) == {
+        "consumerOnboardingComplete": True,
+        "enterpriseOnboardingComplete": False,
+        "onboardingComplete": True,
+    }
+    # 1.1.27's native updater recognizes the literal "true", not "1".
+    assert session.environment["AGY_CLI_DISABLE_AUTO_UPDATE"] == "true"
+
+
 # --- canonical producer identity --------------------------------------------
 #
 # `agy` opens a second conversation of its own to generate a title, and that
