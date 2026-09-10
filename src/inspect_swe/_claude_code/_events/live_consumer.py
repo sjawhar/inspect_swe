@@ -99,10 +99,14 @@ class LiveConsumer(ModelEventSink):
         # already-consumed JSONL records.
         self._seen_native_events: set[str] = set()
 
-        # The wrapper configures these after its owned session ID is known.
+        # The wrapper configures these before the native drain may run. The
+        # session id is known only on the unattended path, which pins its own
+        # `claude -p`; an interactive operator starts as many sessions as they
+        # like, none of them named in advance, and the drain reads them all.
         self._sandbox: SandboxEnvironment | None = None
         self._user: str | None = None
         self._session_id: str | None = None
+        self._native_drain_configured = False
 
         # A root stream can reach its tool_result before sidecar callbacks are
         # delivered. Keep native children open until a complete transcript
@@ -122,12 +126,21 @@ class LiveConsumer(ModelEventSink):
         self,
         sandbox: SandboxEnvironment,
         user: str | None,
-        session_id: str,
+        session_id: str | None,
     ) -> None:
-        """Configure the native session transcript drained by lifecycle hooks."""
+        """Configure the native session transcripts drained by lifecycle hooks.
+
+        ``session_id`` names the one session to drain when the caller created it
+        (the unattended ``claude -p`` path). ``None`` means every session under
+        the user's Claude projects directory: an interactive operator may start
+        several, and pinning one id onto their ``claude`` so the drain could
+        predict a filename is exactly what made a second ``claude`` fail with
+        "Session ID ... is already in use".
+        """
         self._sandbox = sandbox
         self._user = user
         self._session_id = session_id
+        self._native_drain_configured = True
         self._centaur_outer_span_id = self.outer_span_id
         self._native_transcript_drained = False
         self._draining_native_session = False
@@ -137,13 +150,17 @@ class LiveConsumer(ModelEventSink):
 
         ``command`` identifies the native lifecycle boundary that requested this
         drain (score, submit, process completion, or teardown). Identity
-        resolution itself only consumes the wrapper-owned native session files.
+        resolution consumes only native session files, never prompt text.
         """
-        if self._sandbox is None or self._session_id is None:
+        if self._sandbox is None or not self._native_drain_configured:
             raise RuntimeError("Claude native session has not been configured.")
 
-        session_file = shlex.quote(f"{self._session_id}.jsonl")
-        subagent_file = shlex.quote(f"*/{self._session_id}/subagents/agent-*.jsonl")
+        # Root transcripts are `<project>/<session>.jsonl`; sub-agent sidecars are
+        # `<project>/<session>/subagents/agent-*.jsonl`. With a pinned id both
+        # patterns name that session; without one they match every session.
+        session = self._session_id if self._session_id is not None else "*"
+        session_file = shlex.quote(f"{session}.jsonl")
+        subagent_file = shlex.quote(f"*/{session}/subagents/agent-*.jsonl")
         result = await self._sandbox.exec(
             [
                 "sh",
@@ -156,7 +173,7 @@ class LiveConsumer(ModelEventSink):
         )
         if not result.success:
             raise RuntimeError(
-                f"Unable to enumerate Claude session transcript: {result.stderr}"
+                f"Unable to enumerate Claude session transcripts: {result.stderr}"
             )
 
         self._draining_native_session = True
@@ -232,6 +249,7 @@ class LiveConsumer(ModelEventSink):
         self._sandbox = None
         self._user = None
         self._session_id = None
+        self._native_drain_configured = False
         self._native_transcript_drained = True
         self._draining_native_session = False
 

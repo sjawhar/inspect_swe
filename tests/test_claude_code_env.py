@@ -14,7 +14,6 @@ against a value that reintroduces the bug.
 """
 
 import pytest
-
 from inspect_swe._claude_code.env import (
     BLOCKING_MCP_ENV,
     FALSY_ENV_VALUES,

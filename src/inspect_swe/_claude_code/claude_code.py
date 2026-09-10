@@ -479,8 +479,17 @@ def claude_code(
 
             # Centaur begins only after the bridge, binary, command, environment,
             # and working directory are all ready for the operator.
+            #
+            # The operator's invocation carries NO session id. `--session-id` is
+            # create-only, so one pinned id lets exactly one `claude` start in the
+            # sandbox and makes the next one fail with "Session ID ... is already in
+            # use". Every bare `claude` is its own fresh session, as it is outside
+            # the harness; the bridge keeps each as its own conversation, and the
+            # native drain reads every session file rather than one named in
+            # advance. The unattended path below still pins its own `claude -p`,
+            # because it is the only party that ever resumes that session.
             if centaur:
-                invocation = [claude_binary, "--session-id", session_id, *cmd]
+                invocation = [claude_binary, *cmd]
                 try:
                     return await run_claude_code_centaur(
                         options=centaur,
@@ -494,7 +503,7 @@ def claude_code(
                             user=user,
                             sandbox=sbox,
                             bridge_port=bridge.port,
-                            session_id=session_id,
+                            session_id=None,
                         ),
                         consumer=consumer,
                         commands_filter=commands_filter,
@@ -809,15 +818,11 @@ async def run_claude_code_centaur(
     consumer: LiveConsumer,
     commands_filter: CommandsFilter | None = None,
 ) -> AgentState:
-    """Run one interactive Claude session against its wrapper-owned transcript."""
+    """Run interactive Claude sessions and record every one the operator starts."""
     instructions = (
         "Claude Code:\n\n - You may also use Claude Code via the 'claude' command."
     )
-    if session.session_id is None:
-        raise RuntimeError("Claude Centaur requires a wrapper-owned session ID.")
-    consumer.configure_centaur_session(
-        session.sandbox, session.user, session.session_id
-    )
+    consumer.configure_centaur_session(session.sandbox, session.user, None)
     session.refresh = consumer.refresh
 
     agent_env_vars = [f'export {k}="{v}"' for k, v in agent_env.items()]
@@ -827,37 +832,16 @@ async def run_claude_code_centaur(
         'export PATH="$HOME/.local/bin:$PATH"',
         f'ln -sf {claude_cmd[0]} "$HOME/.local/bin/claude"',
     ]
-    if claude_cmd[1:3] != ["--session-id", session.session_id]:
-        raise RuntimeError("Claude Centaur command lost its wrapper-owned session ID.")
-    wrapped_command = shlex.join(claude_cmd)
-    resume_command = shlex.join(
-        [claude_cmd[0], "--resume", session.session_id, *claude_cmd[3:]]
-    )
-    session_id = shlex.quote(session.session_id)
-    alias_cmd = dedent(f"""\
-        claude() {{
-          case "$1" in
-            --resume|-r)
-              if [ "$2" = {session_id} ]; then
-                shift 2
-              elif [ -z "$2" ] || [ "${{2#-}}" != "$2" ]; then
-                shift
-              else
-                printf '%s\\n' 'Centaur Claude sessions may only resume the wrapper-owned session.' >&2
-                return 2
-              fi
-              command {resume_command} "$@"
-              ;;
-            --continue|-c)
-              shift
-              command {resume_command} "$@"
-              ;;
-            *)
-              command {wrapped_command} "$@"
-              ;;
-          esac
-        }}
-    """).strip()
+    if "--session-id" in claude_cmd:
+        raise RuntimeError(
+            "Claude Centaur command must not pin a session id: `--session-id` is "
+            "create-only, so a pinned id fails every `claude` after the first."
+        )
+    # A plain alias, as upstream: `claude --resume`, `--continue` and a bare
+    # `claude` all keep Claude Code's own meaning. Nothing here needs to know
+    # which session the operator is in, because the drain reads them all.
+    alias_cmd = shlex.join(claude_cmd)
+    alias_cmd = "alias claude='" + alias_cmd.replace("'", "'\\''") + "'"
     login_cwd = f"cd -- {shlex.quote(session.cwd)}"
     bashrc = "\n".join(
         agent_env_vars + path_config + ["", claude_config, "", alias_cmd, login_cwd]

@@ -323,6 +323,95 @@ async def test_claude_completion_drain_preserves_stdout_child_parent_owner() -> 
     assert _span_events(SpanEndEvent) == ["agent-task-child"]
 
 
+@pytest.mark.anyio
+async def test_claude_unpinned_drain_reads_every_session_in_the_sandbox() -> None:
+    """An interactive operator may start several `claude` sessions; drain them all.
+
+    The drain used to be configured with one pinned session id and read only
+    that file, which is why the operator's `claude` had to be pinned -- and why
+    a second one collided. Without a pinned id the enumeration must match every
+    root transcript and every sidecar, and each record must be processed.
+    """
+    commands: list[str] = []
+
+    class _Sandbox(SandboxEnvironment):
+        async def exec(
+            self,
+            cmd: list[str],
+            input: str | bytes | None = None,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            user: str | None = None,
+            timeout: int | None = None,
+            timeout_retry: bool = True,
+            concurrency: bool = True,
+        ) -> ExecResult[str]:
+            commands.append(cmd[-1])
+            return ExecResult(
+                success=True,
+                returncode=0,
+                stdout=(
+                    "/home/cc/.claude/projects/project/first.jsonl\n"
+                    "/home/cc/.claude/projects/project/second.jsonl\n"
+                    "/home/cc/.claude/projects/project/second/subagents/agent-kid.jsonl\n"
+                ),
+                stderr="",
+            )
+
+        async def write_file(self, file: str, contents: str | bytes) -> None:
+            raise AssertionError(f"unexpected write to {file}")
+
+        @overload
+        async def read_file(self, file: str, text: Literal[True] = True) -> str: ...
+
+        @overload
+        async def read_file(self, file: str, text: Literal[False]) -> bytes: ...
+
+        async def read_file(self, file: str, text: bool = True) -> str | bytes:
+            if not text:
+                raise AssertionError(f"unexpected binary read of {file}")
+            return {
+                "/home/cc/.claude/projects/project/first.jsonl": (
+                    '{"type":"summary","summary":"first","leafUuid":"a"}'
+                ),
+                "/home/cc/.claude/projects/project/second.jsonl": (
+                    '{"type":"summary","summary":"second","leafUuid":"b"}'
+                ),
+                "/home/cc/.claude/projects/project/second/subagents/agent-kid.jsonl": (
+                    '{"type":"summary","summary":"kid","leafUuid":"c"}'
+                ),
+            }[file]
+
+        @classmethod
+        async def sample_cleanup(
+            cls,
+            task_name: str,
+            config: SandboxEnvironmentConfigType | None,
+            environments: dict[str, SandboxEnvironment],
+            interrupted: bool,
+        ) -> None:
+            return None
+
+    consumer = LiveConsumer()
+    consumer.configure_centaur_session(_Sandbox(), "cc", None)
+    seen: list[dict[str, object]] = []
+    original = consumer.process_jsonl_line
+
+    def record(raw: dict[str, object], **kwargs: object) -> None:
+        seen.append(raw)
+        original(raw)
+
+    consumer.process_jsonl_line = record  # type: ignore[method-assign]
+
+    await consumer.refresh("score")
+
+    # No id was pinned, so the enumeration names every session, not one.
+    assert "'*.jsonl'" in commands[0]
+    assert "'*/*/subagents/agent-*.jsonl'" in commands[0]
+    # Sidecar first (it claims the child response), then both roots.
+    assert [raw["summary"] for raw in seen] == ["kid", "first", "second"]
+
+
 @pytest.mark.parametrize(
     "raw",
     (

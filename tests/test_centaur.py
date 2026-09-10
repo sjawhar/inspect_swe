@@ -218,9 +218,17 @@ def test_run_centaur_tears_down_ready_session_on_cancellation(
     assert lifecycle == ["entered", "exited"]
 
 
-def test_claude_centaur_shell_continues_the_wrapper_session(
+def test_claude_centaur_shell_starts_a_fresh_session_every_time(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """A bare `claude` must never carry a session id, and native flags pass through.
+
+    `--session-id` is create-only. A wrapper that pinned one id onto the
+    operator's `claude` let exactly one session start per sandbox; the next
+    failed with "Session ID ... is already in use". Each invocation is its own
+    session, and `--resume`/`--continue` keep Claude Code's own meaning rather
+    than being rewritten to a wrapper-chosen id.
+    """
     session = _session(AgentState(messages=[]))
     captured: dict[str, str] = {}
     fake_claude = tmp_path / "fake-claude"
@@ -242,25 +250,28 @@ def test_claude_centaur_shell_continues_the_wrapper_session(
     asyncio.run(
         claude_code_mod.run_claude_code_centaur(
             CentaurOptions(),
-            [
-                str(fake_claude),
-                "--session-id",
-                "native-session",
-                "--permission-mode",
-                "bypassPermissions",
-            ],
+            [str(fake_claude), "--permission-mode", "bypassPermissions"],
             {},
             session,
             LiveConsumer(),
         )
     )
+    assert "--session-id" not in captured["bashrc"]
     bashrc_path = tmp_path / "centaur.bashrc"
     bashrc_path.write_text(captured["bashrc"], encoding="utf-8")
     environment = {"HOME": str(tmp_path), "PATH": os.environ["PATH"]}
 
     def run_claude(command: str) -> subprocess.CompletedProcess[str]:
+        # Bash resolves aliases when it parses a line, so the alias must be
+        # defined on an earlier line than the command that uses it -- which is
+        # how a real login shell sees `~/.bashrc` before the operator types.
+        script = (
+            "shopt -s expand_aliases\n"
+            f". {shlex.quote(str(bashrc_path))}\n"
+            f"claude {command}\n"
+        )
         return subprocess.run(
-            ["bash", "-c", f". {shlex.quote(str(bashrc_path))}; claude {command}"],
+            ["bash", "--noprofile", "--norc", "-c", script],
             check=False,
             capture_output=True,
             cwd=tmp_path,
@@ -268,17 +279,33 @@ def test_claude_centaur_shell_continues_the_wrapper_session(
             text=True,
         )
 
-    expected = "--resume\nnative-session\n--permission-mode\nbypassPermissions\n--\nnext task\n"
-    resumed = run_claude("--resume native-session -- 'next task'")
-    continued = run_claude("--continue -- 'next task'")
-    foreign = run_claude("--resume foreign-session")
+    first = run_claude("-- 'first task'")
+    second = run_claude("-- 'second task'")
+    resumed = run_claude("--resume some-session -- 'next task'")
 
+    assert first.returncode == 0
+    assert first.stdout == "--permission-mode\nbypassPermissions\n--\nfirst task\n"
+    assert second.returncode == 0
+    assert second.stdout == "--permission-mode\nbypassPermissions\n--\nsecond task\n"
     assert resumed.returncode == 0
-    assert resumed.stdout == expected
-    assert continued.returncode == 0
-    assert continued.stdout == expected
-    assert foreign.returncode == 2
-    assert "wrapper-owned session" in foreign.stderr
+    assert resumed.stdout == (
+        "--permission-mode\nbypassPermissions\n--resume\nsome-session\n--\nnext task\n"
+    )
+
+
+def test_claude_centaur_refuses_a_pinned_session_id() -> None:
+    """The guard that used to REQUIRE the pin now refuses it."""
+    session = _session(AgentState(messages=[]))
+    with pytest.raises(RuntimeError, match="must not pin a session id"):
+        asyncio.run(
+            claude_code_mod.run_claude_code_centaur(
+                CentaurOptions(),
+                ["claude", "--session-id", "pinned"],
+                {},
+                session,
+                LiveConsumer(),
+            )
+        )
 
 
 def test_run_centaur_preserves_cancellation_when_recorder_finalization_fails(
