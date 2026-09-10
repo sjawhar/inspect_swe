@@ -81,7 +81,12 @@ def test_antigravity_cli_factory_forwards_custom_bridge_and_centaur_options(
     ) -> AsyncIterator[SimpleNamespace]:
         assert state is initial_state
         bridge_options.update(kwargs)
-        yield SimpleNamespace(port=3001, mcp_server_configs=[], state=bridge_state)
+        yield SimpleNamespace(
+            port=3001,
+            mcp_server_configs=[],
+            bridged_tools={},
+            state=bridge_state,
+        )
 
     async def capture_centaur_dispatch(
         *,
@@ -154,16 +159,15 @@ def test_antigravity_cli_factory_forwards_custom_bridge_and_centaur_options(
         "gemini-3.7-flash",
         "--effort",
         "high",
-        "--output-format",
-        "text",
-        "--disable-slash-commands",
     )
     assert session.environment == {
         "GOOGLE_GEMINI_BASE_URL": "http://localhost:3001",
         "GEMINI_API_KEY": "api-key",
-        "AGY_CLI_DISABLE_AUTO_UPDATE": "1",
+        # "true", not "1": the CLI ignores "1" and self-updates anyway, replacing the
+        # pinned binary mid-session. HIDE_LOGO below is a different switch that does
+        # take "1", so the two legitimately disagree.
+        "AGY_CLI_DISABLE_AUTO_UPDATE": "true",
         "AGY_CLI_HIDE_LOGO": "1",
-        "PATH": "/usr/local/bin:/usr/bin:/bin",
         "HOME": "/home/operator",
         "OPERATOR_MARKER": "enabled",
     }
