@@ -9,6 +9,7 @@ from inspect_swe import (
     download_agent_binary,
     download_wheels_tarball,
 )
+from inspect_swe._util.download import _request_headers
 
 
 @pytest.mark.slow
@@ -228,3 +229,52 @@ def test_ensure_pip_available_raises_on_failure() -> None:
             _ensure_pip_available()
 
         assert "ensurepip disabled" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("token_var", ["GITHUB_TOKEN", "GH_TOKEN"])
+def test_github_api_requests_authenticate_when_a_token_is_present(
+    monkeypatch: pytest.MonkeyPatch, token_var: str
+) -> None:
+    """Release-asset lookups must send a token when one is available.
+
+    Unauthenticated GitHub REST is 60 requests/hour per source IP. Shared CI runners
+    exhaust that between them, and the eval then fails resolving an agent binary
+    unrelated to the task under test.
+    """
+    for var in ("GITHUB_TOKEN", "GH_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv(token_var, "sentinel-token")
+
+    assert _request_headers(
+        "https://api.github.com/repos/openai/codex/releases/tags/rust-v0.153.1"
+    ) == {"Authorization": "Bearer sentinel-token"}
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        pytest.param("https://objects.githubusercontent.com/asset", id="github-cdn"),
+        pytest.param("https://code.kimi.com/latest.json", id="third-party-cdn"),
+        pytest.param("https://storage.googleapis.com/bucket/x", id="gcs"),
+        pytest.param("https://api.github.com.evil.test/repos/x", id="suffix-lookalike"),
+    ],
+)
+def test_no_token_is_sent_to_hosts_other_than_the_github_api(
+    monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    """The token authenticates one metadata API, not every download.
+
+    The asset CDNs need no credential, and the lookalike case is why the host is compared
+    exactly rather than by suffix: `api.github.com.evil.test` must not collect a bearer
+    token.
+    """
+    monkeypatch.setenv("GITHUB_TOKEN", "sentinel-token")
+    assert _request_headers(url) == {}
+
+
+def test_github_api_requests_are_anonymous_without_a_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for var in ("GITHUB_TOKEN", "GH_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    assert _request_headers("https://api.github.com/repos/openai/codex") == {}
