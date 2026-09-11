@@ -29,6 +29,7 @@ The CLI uses its native Gemini API client, configured to call the local Inspect 
 | `effort` | CLI reasoning effort: `"low"`, `"medium"`, `"high"`, or `None` to omit `--effort`. Defaults to `"low"`. |
 | `filter` | Filter for intercepting bridged model requests. |
 | `retry_refusals` | Number of refusal retries. |
+| `exec_timeout` | Wall-time limit in seconds. Default: 1,800 (30 minutes); a healthy invocation exceeding it is terminated. `0` times out immediately; `None` is unbounded. |
 | `cwd` | Working directory for the CLI session. |
 | `env` | Environment variables for the CLI process. |
 | `user` | Sandbox user that runs the CLI. |
