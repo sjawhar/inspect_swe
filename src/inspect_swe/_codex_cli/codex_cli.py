@@ -24,14 +24,18 @@ from inspect_ai.scorer import score
 from inspect_ai.tool import MCPServerConfig, Skill, install_skills, read_skills
 from inspect_ai.util import SandboxEnvironment, checkpointer, store
 from inspect_ai.util import sandbox as sandbox_env
-from inspect_ai.util._sandbox import ExecRemoteAwaitableOptions
 from typing_extensions import Unpack
 
 from inspect_swe._util._async import is_callable_coroutine
 from inspect_swe._util.centaur import CentaurOptions, run_centaur
 from inspect_swe._util.messages import build_user_prompt
 from inspect_swe._util.path import join_path
-from inspect_swe._util.sandbox import resolve_agent_cwd, sandbox_exec
+from inspect_swe._util.sandbox import (
+    DEFAULT_CLI_EXEC_TIMEOUT_SECONDS,
+    resolve_agent_cwd,
+    run_unattended_agent,
+    sandbox_exec,
+)
 from inspect_swe._util.toml import to_toml
 from inspect_swe._util.trace import trace
 
@@ -81,6 +85,7 @@ def codex_cli(
     filter: GenerateFilter | None = None,
     retry_refusals: int | None = None,
     home_dir: str | None = None,
+    exec_timeout: float | None = DEFAULT_CLI_EXEC_TIMEOUT_SECONDS,
     cwd: str | None = None,
     env: dict[str, str] | None = None,
     user: str | None = None,
@@ -121,6 +126,9 @@ def codex_cli(
         filter: Filter for intercepting bridged model requests.
         retry_refusals: Should refusals be retried? (pass number of times to retry)
         home_dir: Home directory to use for codex cli. If set, AGENTS.md, skills, and the MCP configuration will be written here.
+        exec_timeout: Wall-time limit in seconds for each unattended Codex CLI
+            invocation. Defaults to 30 minutes; an invocation that exceeds it is
+            terminated. `0` times out immediately; `None` disables the deadline.
         cwd: Working directory to run codex cli within.
         env: Environment variables to set for codex cli
         user: User to execute codex cli with.
@@ -347,24 +355,25 @@ def codex_cli(
                         agent_cmd.extend(["resume", "--last"])
 
                     # run agent
-                    result = await sbox.exec_remote(
-                        cmd=["bash", "-c", 'exec 0</dev/null; "$@"', "bash"]
-                        + agent_cmd,
-                        options=ExecRemoteAwaitableOptions(
-                            cwd=agent_cwd, env=agent_env, user=user, concurrency=False
-                        ),
-                        stream=False,
-                    )
+                    try:
+                        result = await run_unattended_agent(
+                            sbox,
+                            ["bash", "-c", 'exec 0</dev/null; "$@"', "bash"]
+                            + agent_cmd,
+                            cwd=agent_cwd,
+                            env=agent_env,
+                            user=user,
+                            timeout=exec_timeout,
+                            agent_name="Codex",
+                        )
+                        if debug:
+                            debug_output.append(result.stdout)
+                            debug_output.append(result.stderr)
 
-                    # record output for debug
-                    if debug:
-                        debug_output.append(result.stdout)
-                        debug_output.append(result.stderr)
-
-                    # close any sub-agent spans left open by this attempt so the
-                    # span tree stays balanced across restarts and on error
-                    # (Codex doesn't carry sub-agent spans across resumes)
-                    consumer.reset()
+                    finally:
+                        # Codex does not carry sub-agent spans across resumes.
+                        # Close any spans left open when the subprocess errors or times out.
+                        consumer.reset()
 
                     # raise for error
                     if not result.success:
