@@ -20,7 +20,6 @@ from inspect_ai.tool import MCPServerConfig, Skill, install_skills, read_skills
 from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
 from inspect_ai.util import sandbox as sandbox_env
 from inspect_ai.util import store
-from inspect_ai.util._sandbox import ExecRemoteAwaitableOptions
 
 from .._util._async import is_callable_coroutine
 from .._util.agentbinary import ensure_agent_binary_installed
@@ -28,7 +27,11 @@ from .._util.centaur import CentaurOptions, CentaurSession, CommandsFilter, run_
 from .._util.mcp_ready import DEFAULT_MCP_READY_TIMEOUT, wait_for_mcp_endpoints
 from .._util.messages import build_user_prompt
 from .._util.path import join_path
-from .._util.sandbox import resolve_agent_cwd
+from .._util.sandbox import (
+    DEFAULT_CLI_EXEC_TIMEOUT_SECONDS,
+    resolve_agent_cwd,
+    run_unattended_agent,
+)
 from .._util.trace import trace
 from .agentbinary import antigravity_cli_binary_source
 
@@ -75,6 +78,7 @@ def antigravity_cli(
     commands_filter: CommandsFilter | None = None,
     model_resolver: ModelResolver | None = None,
     accumulate_conversations: bool = False,
+    exec_timeout: float | None = DEFAULT_CLI_EXEC_TIMEOUT_SECONDS,
 ) -> Agent:
     """Antigravity CLI agent.
 
@@ -134,6 +138,9 @@ def antigravity_cli(
             `None` to defer.
         accumulate_conversations: Keep every bridge conversation in
             `state.messages` rather than only the main agent loop.
+        exec_timeout: Wall-time limit in seconds for each unattended Antigravity
+            invocation. Defaults to 30 minutes; an invocation that exceeds it is
+            terminated. `0` times out immediately; `None` disables the deadline.
     """
     # resolve centaur
     if centaur is True:
@@ -312,16 +319,14 @@ def antigravity_cli(
                             timeout=mcp_ready_timeout,
                             required=True,
                         )
-                    result = await sbox.exec_remote(
-                        cmd=["bash", "-c", 'exec 0</dev/null; "$@"', "bash"]
-                        + agent_cmd,
-                        options=ExecRemoteAwaitableOptions(
-                            cwd=agent_cwd,
-                            env=agent_env,
-                            user=user,
-                            concurrency=False,
-                        ),
-                        stream=False,
+                    result = await run_unattended_agent(
+                        sbox,
+                        ["bash", "-c", 'exec 0</dev/null; "$@"', "bash"] + agent_cmd,
+                        cwd=agent_cwd,
+                        env=agent_env,
+                        user=user,
+                        timeout=exec_timeout,
+                        agent_name="Antigravity",
                     )
 
                     if debug:
