@@ -182,6 +182,10 @@ def test_unattended_factory_passes_all_bridge_contracts_and_verifies_result() ->
         patch.object(module, "sandbox_env", return_value=sbox),
         patch.object(module, "store", return_value=_Store()),
         patch.object(module, "resolve_agent_cwd", AsyncMock(return_value="/workspace")),
+        # The factory resolves `antigravity_cli_binary_source()` BEFORE the installer
+        # runs, and that resolution creates ~/.cache/inspect_swe/... on the host. The
+        # patched installer ignores its argument, so a sentinel is enough.
+        patch.object(module, "antigravity_cli_binary_source", lambda: object()),
         patch.object(
             module, "ensure_agent_binary_installed", AsyncMock(return_value="/opt/agy")
         ),
@@ -288,6 +292,10 @@ def test_centaur_factory_preserves_session_and_scopes_the_named_sandbox() -> Non
         patch.object(module, "sandbox_env", return_value=sbox) as sandbox_env,
         patch.object(module, "store", return_value=_Store()),
         patch.object(module, "resolve_agent_cwd", AsyncMock(return_value="/workspace")),
+        # The factory resolves `antigravity_cli_binary_source()` BEFORE the installer
+        # runs, and that resolution creates ~/.cache/inspect_swe/... on the host. The
+        # patched installer ignores its argument, so a sentinel is enough.
+        patch.object(module, "antigravity_cli_binary_source", lambda: object()),
         patch.object(
             module, "ensure_agent_binary_installed", AsyncMock(return_value="/opt/agy")
         ),
@@ -371,6 +379,10 @@ def test_unattended_reentry_resumes_only_the_seeded_native_conversation() -> Non
         patch.object(module, "sandbox_env", return_value=sbox),
         patch.object(module, "store", return_value=_Store()),
         patch.object(module, "resolve_agent_cwd", AsyncMock(return_value="/workspace")),
+        # The factory resolves `antigravity_cli_binary_source()` BEFORE the installer
+        # runs, and that resolution creates ~/.cache/inspect_swe/... on the host. The
+        # patched installer ignores its argument, so a sentinel is enough.
+        patch.object(module, "antigravity_cli_binary_source", lambda: object()),
         patch.object(
             module, "ensure_agent_binary_installed", AsyncMock(return_value="/opt/agy")
         ),
