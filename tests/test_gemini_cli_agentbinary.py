@@ -258,7 +258,7 @@ def test_sandbox_version_uses_the_attached_binary_without_network_resolution() -
         )
 
     assert (binary, node) == ("/usr/local/bin/gemini", "/node")
-    installed_binary.assert_awaited_once_with(sandbox, "/node", "agent")
+    installed_binary.assert_awaited_once_with(sandbox, "agent")
 
 
 def test_sandbox_version_fails_loudly_when_the_attached_binary_is_missing() -> None:
@@ -285,3 +285,30 @@ def test_sandbox_version_fails_loudly_when_the_attached_binary_is_missing() -> N
         pytest.raises(RuntimeError, match="attached Gemini CLI binary is unavailable"),
     ):
         anyio.run(agentbinary.ensure_gemini_cli_setup, sandbox, "sandbox", "agent")
+
+
+def test_sandbox_gemini_binary_execs_the_attached_launcher_directly() -> None:
+    """Regression for a bug where `_sandbox_gemini_binary` ran the attached executable through the Node interpreter.
+
+    Our build writes a self-executing shell launcher at the attached `gemini`
+    path (mirroring claude_code/codex_cli/opencode), so feeding it to `node` as
+    source (`[node_path, gemini_binary, ...]`) fails with a SyntaxError on the
+    very first invocation, on every Node version. The attached binary must be
+    exec'd directly, with no interpreter prefix, exactly like its
+    claude/codex/opencode siblings in `ensure_agent_binary_installed`.
+    """
+    sandbox = Mock()
+    which_result = Mock(success=True, stdout="/opt/agent-cli/gemini/bin/gemini\n")
+    version_result = Mock(success=True, stdout="0.58.0\n", stderr="")
+    sandbox.exec = AsyncMock(side_effect=[which_result, version_result])
+
+    binary = anyio.run(agentbinary._sandbox_gemini_binary, sandbox, "agent")
+
+    assert binary == "/opt/agent-cli/gemini/bin/gemini"
+    assert sandbox.exec.await_count == 2
+    version_call = sandbox.exec.await_args_list[1]
+    assert version_call.kwargs["cmd"] == [
+        "/opt/agent-cli/gemini/bin/gemini",
+        "--version",
+    ]
+    assert version_call.kwargs["user"] == "agent"

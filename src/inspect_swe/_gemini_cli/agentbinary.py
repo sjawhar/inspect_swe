@@ -41,7 +41,7 @@ async def ensure_gemini_cli_setup(
     platform = await detect_sandbox_platform(sandbox)
     node_binary = await ensure_node_available(sandbox, platform, user)
     if version == "sandbox":
-        return await _sandbox_gemini_binary(sandbox, node_binary, user), node_binary
+        return await _sandbox_gemini_binary(sandbox, user), node_binary
 
     gemini_version = await resolve_gemini_version(version)
     gemini_binary = await ensure_gemini_cli_installed(
@@ -59,9 +59,7 @@ async def resolve_gemini_version(
     return version
 
 
-async def _sandbox_gemini_binary(
-    sandbox: SandboxEnvironment, node_path: str, user: str | None
-) -> str:
+async def _sandbox_gemini_binary(sandbox: SandboxEnvironment, user: str | None) -> str:
     """Return the pre-attached Gemini executable without consulting a release channel."""
     result = await sandbox.exec(bash_command("which gemini"), user=user)
     if not result.success or not result.stdout.strip():
@@ -69,9 +67,14 @@ async def _sandbox_gemini_binary(
             "Gemini CLI version='sandbox' requires an attached gemini executable"
         )
     gemini_binary = result.stdout.strip()
-    version_result = await sandbox.exec(
-        cmd=[node_path, gemini_binary, "--version"], user=user
-    )
+    # The attached executable is a self-executing launcher (a shell script or
+    # native binary on PATH), exactly like the claude_code/codex_cli/opencode
+    # attached binaries in `_util/agentbinary.py`'s `ensure_agent_binary_installed`
+    # — run it directly rather than prefixing it with the Node interpreter. Doing
+    # so previously fed our shell launcher's `#!/bin/sh` + `exec node ... "$@"`
+    # body to `node` as source, which fails with a SyntaxError on every Node
+    # version on the very first invocation.
+    version_result = await sandbox.exec(cmd=[gemini_binary, "--version"], user=user)
     if not version_result.success:
         raise RuntimeError(
             "attached Gemini CLI executable failed its version check:\n"
