@@ -40,6 +40,12 @@ from .toolview import tool_view
 # transcript identity for this consumer.
 _CONVERSATION_EVENT_TYPES = frozenset({"user", "assistant", "system"})
 
+# Opens a subagent sidecar, ahead of the replayed turn that spawned it.
+_FORK_CONTEXT_REF = "fork-context-ref"
+
+# Distinguishes "root owns this response" (None) from "nobody has claimed it".
+_UNSET = object()
+
 
 @dataclass
 class _OpenAgent:
@@ -83,6 +89,22 @@ class LiveConsumer(ModelEventSink):
         # race without inferring a relation from content or timing.
         self._native_agent_responses: dict[str, set[str]] = {}
         self._delivered_native_responses: set[str] = set()
+
+        # A subagent sidecar opens with a `fork-context-ref` row and then
+        # replays the turn that spawned it: the root's response ID under this
+        # agent's ID, with a UUID of its own. That replay is inherited
+        # context, not the child's work, so the agent is marked here and its
+        # next assistant record claims nothing. The drain reads sidecars
+        # before the root session, so the marker -- not arrival order -- is
+        # what keeps the response with the root.
+        self._fork_context_replay: set[str] = set()
+
+        # That first record is HELD rather than dropped, one per fork agent.
+        # A sidecar's genuine first turn carries `isSidechain` too, so the
+        # replay is only confirmed once the root claims the same response.
+        # Resolved at the end of the drain: claimed means replay (discard),
+        # unclaimed means the child really produced it (register it then).
+        self._held_fork_records: dict[str, dict[str, Any]] = {}
 
         # Child ModelEvents wait here until their completed response ID appears
         # in the native session transcript. Dict insertion order preserves their
@@ -203,8 +225,34 @@ class LiveConsumer(ModelEventSink):
         finally:
             self._draining_native_session = False
 
+        self._resolve_fork_context_holds()
         self._native_transcript_drained = True
         self._flush_pending_events()
+
+    def _resolve_fork_context_holds(self) -> None:
+        """Settle every held fork record once the whole drain has been read.
+
+        A response the root also wrote is the spawning turn replayed into the
+        sidecar: it belongs to the root, so the held copy is discarded and the
+        child never waits on it. A response nothing else claims was the fork's
+        own first turn, so it registers now, exactly as it would have.
+        """
+        held = self._held_fork_records
+        self._held_fork_records = {}
+        self._fork_context_replay.clear()
+        for raw in held.values():
+            message = raw.get("message")
+            response_id = message.get("id") if isinstance(message, dict) else None
+            if (
+                isinstance(response_id, str)
+                and self._response_agents.get(response_id, _UNSET) is None
+            ):
+                # The ROOT wrote this response too, which is what makes the
+                # held record the replayed spawning turn. Only that confirms
+                # it: another agent holding the id is a genuine conflict, and
+                # reprocessing below is what raises on it.
+                continue
+            self._handle_assistant(raw)
 
     async def drain_completion(self) -> None:
         """Drain native transcript files after an unattended CLI process exits."""
@@ -240,6 +288,8 @@ class LiveConsumer(ModelEventSink):
         self._response_tools.clear()
         self._native_agent_responses.clear()
         self._delivered_native_responses.clear()
+        self._fork_context_replay.clear()
+        self._held_fork_records.clear()
         self._pending_compactions.clear()
         self._seen_native_events.clear()
         self._emitted_events.clear()
@@ -302,6 +352,14 @@ class LiveConsumer(ModelEventSink):
         span; otherwise the durable sidecar is authoritative.
         """
         event_type = raw.get("type")
+        if event_type == _FORK_CONTEXT_REF:
+            # Opens a subagent sidecar. The record that follows it replays the
+            # spawning turn as inherited context; mark the agent so that
+            # replay claims nothing.
+            forked_agent = raw.get("agentId")
+            if isinstance(forked_agent, str) and forked_agent:
+                self._fork_context_replay.add(forked_agent)
+            return
         if event_type not in _CONVERSATION_EVENT_TYPES:
             return
 
@@ -465,6 +523,22 @@ class LiveConsumer(ModelEventSink):
 
         agent_id = raw.get("agentId")
         response_agent_id = agent_id if isinstance(agent_id, str) and agent_id else None
+
+        if (
+            raw.get("isSidechain") is True
+            and response_agent_id is not None
+            and response_agent_id in self._fork_context_replay
+        ):
+            self._fork_context_replay.discard(response_agent_id)
+            if response_agent_id not in self._held_fork_records:
+                # The first record after this agent's `fork-context-ref` is
+                # the spawning turn replayed as inherited context -- unless
+                # this fork wrote its own first turn there instead, which the
+                # record itself cannot tell us. Hold it: the root claiming
+                # this response later proves it was the replay, and nothing
+                # claiming it proves it was the child's own work.
+                self._held_fork_records[response_agent_id] = raw
+                return
         parent_tool_use_id = raw.get("parent_tool_use_id")
         if parent_tool_use_id is not None and (
             not isinstance(parent_tool_use_id, str) or not parent_tool_use_id
@@ -475,7 +549,27 @@ class LiveConsumer(ModelEventSink):
             response_id in self._response_agents
             and self._response_agents[response_id] != response_agent_id
         ):
-            raise RuntimeError("Claude native response ID changed agent ownership.")
+            # A sidechain record claiming a response the root already holds is
+            # either of two things, and only one of them is a conflict.
+            if (
+                raw.get("isSidechain") is True
+                and response_agent_id is not None
+                and self._response_agents[response_id] is None
+            ):
+                if response_id not in self._response_tools:
+                    # A subagent sidecar opens by replaying the turn that
+                    # spawned it: the root's response ID under the child's
+                    # agent ID, with a UUID of its own, so the dedupe above
+                    # does not reach it. That replay is context, not the
+                    # child's work. Owning it would attribute the root's call
+                    # to the child and leave the child's span waiting on a
+                    # response it never produces.
+                    return
+                # Otherwise the response is already tied to a Task span by a
+                # stdout mirror that could not name its agent, and the durable
+                # sidecar is authoritative for the owner: adopt it.
+            else:
+                raise RuntimeError("Claude native response ID changed agent ownership.")
         if (
             parent_tool_use_id is not None
             and response_id in self._response_tools

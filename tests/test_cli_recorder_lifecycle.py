@@ -183,6 +183,297 @@ def test_claude_binds_overlapping_child_call_from_native_response_and_agent_ids(
     assert _span_events(SpanEndEvent) == ["agent-task-1", "agent-task-2"]
 
 
+def test_claude_subagent_sidecar_replaying_its_spawn_turn_keeps_root_ownership() -> (
+    None
+):
+    """A subagent sidecar opens by replaying the turn that spawned it.
+
+    Row shape captured from a real session (agent-c#19396): Claude writes one
+    assistant message as several records sharing `message.id`, one per content
+    block, and `<session>/subagents/agent-*.jsonl` opens with `fork-context-ref`
+    followed by a replay of the spawning `tool_use` record -- the parent's
+    `message.id`, the child's `agentId`, and a `uuid` of its own. The replay is
+    context, so the root keeps the response and the child never waits on it.
+    """
+    consumer = LiveConsumer()
+    spawn = _model_event(
+        [],
+        ModelOutput.from_message(
+            ChatMessageAssistant(
+                id="spawn-response",
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="task-child",
+                        function="Agent",
+                        arguments={
+                            "description": "audit the store",
+                            "subagent_type": "fork",
+                        },
+                    )
+                ],
+            )
+        ),
+    )
+    consumer.on_pending(spawn)
+    consumer.on_complete(spawn)
+
+    # `refresh()` reads `/subagents/agent-*.jsonl` BEFORE the root session, so
+    # the sidecar reaches the consumer first. Feeding the parent first hides
+    # this bug entirely, which is how the first fix for it looked correct.
+    consumer.process_jsonl_line({"type": "fork-context-ref", "agentId": "child-agent"})
+    consumer.process_jsonl_line(
+        {
+            "uuid": "sidecar-spawn-replay",
+            "type": "assistant",
+            "agentId": "child-agent",
+            "isSidechain": True,
+            "message": {
+                "id": "spawn-response",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "task-child",
+                        "name": "Agent",
+                        "input": {"subagent_type": "fork"},
+                    }
+                ],
+            },
+        }
+    )
+
+    # The root session then writes that one message as several records, one
+    # per content block; the sidecar replayed only the tool_use one.
+    consumer.process_jsonl_line(
+        {
+            "uuid": "parent-thinking",
+            "type": "assistant",
+            "isSidechain": False,
+            "message": {"id": "spawn-response", "content": [{"type": "thinking"}]},
+        }
+    )
+    consumer.process_jsonl_line(
+        {
+            "uuid": "parent-tool-use",
+            "type": "assistant",
+            "isSidechain": False,
+            "message": {
+                "id": "spawn-response",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "task-child",
+                        "name": "Agent",
+                        "input": {"subagent_type": "fork"},
+                    }
+                ],
+            },
+        }
+    )
+
+    child = _model_event(
+        [],
+        ModelOutput.from_message(
+            ChatMessageAssistant(id="child-response", content="audited")
+        ),
+    )
+    consumer.on_pending(child)
+    consumer.on_complete(child)
+    consumer.process_jsonl_line(
+        {
+            "uuid": "sidecar-child-response",
+            "type": "assistant",
+            "agentId": "child-agent",
+            "isSidechain": True,
+            "message": {"id": "child-response"},
+        }
+    )
+    consumer.process_jsonl_line(
+        {
+            "uuid": "child-result",
+            "type": "user",
+            "toolUseResult": {"agentId": "child-agent"},
+            "message": {
+                "content": [{"type": "tool_result", "tool_use_id": "task-child"}]
+            },
+        }
+    )
+
+    # `refresh()` settles held fork records once the whole drain is read.
+    consumer._resolve_fork_context_holds()
+
+    assert child.span_id == "agent-task-child"
+    # The spawning turn is the root's work, and the child must not wait on a
+    # response it never produced: re-owning it leaves this span open forever.
+    assert spawn.span_id is None
+    assert consumer._response_agents["spawn-response"] is None
+    assert _span_events(SpanEndEvent) == ["agent-task-child"]
+
+
+def test_claude_fork_first_turn_is_kept_when_no_root_record_claims_it() -> None:
+    """A fork whose first sidecar record is its OWN turn keeps it.
+
+    The replay and a genuine first turn are the same shape at the moment they
+    arrive -- both sidechain, both carrying the fork's agent ID -- so the
+    record is held and settled by what the rest of the drain does. Nothing
+    else claims this response, so the child produced it.
+    """
+    consumer = LiveConsumer()
+    spawn = _model_event(
+        [],
+        ModelOutput.from_message(
+            ChatMessageAssistant(
+                id="spawn-response",
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="task-child",
+                        function="Agent",
+                        arguments={"subagent_type": "fork"},
+                    )
+                ],
+            )
+        ),
+    )
+    consumer.on_pending(spawn)
+    consumer.on_complete(spawn)
+
+    consumer.process_jsonl_line({"type": "fork-context-ref", "agentId": "child-agent"})
+    consumer.process_jsonl_line(
+        {
+            "uuid": "sidecar-first-turn",
+            "type": "assistant",
+            "agentId": "child-agent",
+            "isSidechain": True,
+            "message": {"id": "child-own-response"},
+        }
+    )
+    consumer.process_jsonl_line(
+        {
+            "uuid": "child-result",
+            "type": "user",
+            "toolUseResult": {"agentId": "child-agent"},
+            "message": {
+                "content": [{"type": "tool_result", "tool_use_id": "task-child"}]
+            },
+        }
+    )
+    consumer._resolve_fork_context_holds()
+
+    # Unskipped: no root record ever claimed it, so it is the child's.
+    assert consumer._response_agents["child-own-response"] == "child-agent"
+
+
+def test_claude_held_fork_record_still_raises_on_a_genuine_double_claim() -> None:
+    """Holding a record must not swallow the conflict the guard exists for.
+
+    Two forks claim one response ID and no root record ever arrives, so
+    nothing confirms the held record as a replay. Settling it has to put it
+    back through ownership, where the second claimant raises -- discarding it
+    because *someone* holds the ID would lose exactly the corruption this
+    guard was written to catch.
+    """
+    consumer = LiveConsumer()
+    consumer.process_jsonl_line({"type": "fork-context-ref", "agentId": "agent-a"})
+    consumer.process_jsonl_line(
+        {
+            "uuid": "agent-a-first",
+            "type": "assistant",
+            "agentId": "agent-a",
+            "isSidechain": True,
+            "message": {"id": "shared-response", "content": [{"type": "text"}]},
+        }
+    )
+    consumer.process_jsonl_line(
+        {
+            "uuid": "agent-b-claim",
+            "type": "assistant",
+            "agentId": "agent-b",
+            "isSidechain": True,
+            "message": {"id": "shared-response", "content": [{"type": "tool_use"}]},
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="changed agent ownership"):
+        consumer._resolve_fork_context_holds()
+
+
+def test_claude_non_sidechain_record_after_fork_context_is_never_held() -> None:
+    """The window is for sidecar records only.
+
+    A root record that happens to follow a `fork-context-ref` carrying the
+    same agent ID is not a replay and must register immediately -- dropping
+    the `isSidechain` conjunct has to fail here.
+    """
+    consumer = LiveConsumer()
+    consumer.process_jsonl_line({"type": "fork-context-ref", "agentId": "child-agent"})
+    consumer.process_jsonl_line(
+        {
+            "uuid": "root-record",
+            "type": "assistant",
+            "agentId": "child-agent",
+            "isSidechain": False,
+            "message": {"id": "root-response"},
+        }
+    )
+
+    assert consumer._response_agents["root-response"] == "child-agent"
+    assert not consumer._held_fork_records
+
+
+def test_claude_raises_when_two_native_agents_claim_one_response() -> None:
+    """A genuine double claim is still a contract violation.
+
+    The sidecar exemption above is narrow on purpose: it applies only to a
+    sidechain record replaying a response the ROOT holds. Two agents naming
+    themselves owner of one `message.id` is the corruption the guard exists to
+    catch, and must not be swallowed with the replays.
+    """
+    consumer = LiveConsumer()
+    consumer.process_jsonl_line(
+        {
+            "uuid": "first-claim",
+            "type": "assistant",
+            "agentId": "agent-one",
+            "message": {"id": "shared-response", "content": [{"type": "text"}]},
+        }
+    )
+    with pytest.raises(RuntimeError, match="changed agent ownership"):
+        consumer.process_jsonl_line(
+            {
+                "uuid": "second-claim",
+                "type": "assistant",
+                "agentId": "agent-two",
+                "message": {
+                    "id": "shared-response",
+                    "content": [{"type": "tool_use"}],
+                },
+            }
+        )
+
+    # Nor does the sidechain flag excuse a claim against another agent: the
+    # exemption requires the response to be the root's, not another child's.
+    sidechain = LiveConsumer()
+    sidechain.process_jsonl_line(
+        {
+            "uuid": "owning-claim",
+            "type": "assistant",
+            "agentId": "agent-one",
+            "message": {"id": "shared-response"},
+        }
+    )
+    with pytest.raises(RuntimeError, match="changed agent ownership"):
+        sidechain.process_jsonl_line(
+            {
+                "uuid": "sidechain-claim",
+                "type": "assistant",
+                "agentId": "agent-two",
+                "isSidechain": True,
+                "message": {"id": "shared-response"},
+            }
+        )
+
+
 @pytest.mark.anyio
 async def test_claude_completion_drain_preserves_stdout_child_parent_owner() -> None:
     class _Sandbox(SandboxEnvironment):
