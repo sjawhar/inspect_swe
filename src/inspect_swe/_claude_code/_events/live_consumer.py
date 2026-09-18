@@ -20,9 +20,11 @@ stream-json stdout channel does not include child-session records.
 
 import json
 import shlex
+from collections.abc import Awaitable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
+import anyio
 from inspect_ai.event import CompactionEvent, SpanBeginEvent, SpanEndEvent
 from inspect_ai.event._model import ModelEvent
 from inspect_ai.log import transcript
@@ -42,6 +44,35 @@ _CONVERSATION_EVENT_TYPES = frozenset({"user", "assistant", "system"})
 
 # Opens a subagent sidecar, ahead of the replayed turn that spawned it.
 _FORK_CONTEXT_REF = "fork-context-ref"
+
+T = TypeVar("T")
+
+# Bounds on a native-session drain, one per step, none cumulative. A whole-drain
+# budget false-fails a long, healthy session (replaying a real 1470-row capture at
+# a plausible per-read latency crossed 120 s on a working sandbox), so each step
+# -- the enumerating `find`, then every file read -- gets its own deadline and
+# nothing sums.
+#
+# `NATIVE_DRAIN_STEP_TIMEOUT_SECONDS` is the deadline for the enumeration and the
+# floor for every read. A read's deadline grows with the file: the enumeration
+# reports each size, and the read may take that many bytes at
+# `NATIVE_DRAIN_FLOOR_BYTES_PER_SECOND` on top of the floor. So a large session
+# file that is slow but progressing is never mistaken for a dead pod (the
+# provider allows 100 MiB per file; at the floor rate that is ~7 min, not 60 s),
+# while a dead pod -- the case this exists for, agent-c#19253: hawk's stop had
+# interrupted the sample, the pod was gone, the teardown drain's exec never
+# returned, and the runner reported the run live for 15 and 25 hours -- still
+# fails within the floor on the enumeration or any ordinary file.
+#
+# The bound has to live here, client-side: the K8s provider's own `timeout=`
+# runs the `timeout` binary inside the pod, which a dead pod never executes,
+# `read_file` takes no deadline at all, and its websocket read blocks with
+# none. Cancelling our await does not unblock the provider's worker thread; on
+# a dead pod that thread stays parked on a socket that will never answer. One
+# parked thread per abandoned step is the residual cost of not hanging forever;
+# closing it needs a deadline inside the provider's transport, not here.
+NATIVE_DRAIN_STEP_TIMEOUT_SECONDS: float = 60.0
+NATIVE_DRAIN_FLOOR_BYTES_PER_SECOND: float = 256 * 1024
 
 # Distinguishes "root owns this response" (None) from "nobody has claimed it".
 _UNSET = object()
@@ -184,15 +215,44 @@ class LiveConsumer(ModelEventSink):
         session = self._session_id if self._session_id is not None else "*"
         session_file = shlex.quote(f"{session}.jsonl")
         subagent_file = shlex.quote(f"*/{session}/subagents/agent-*.jsonl")
-        result = await self._sandbox.exec(
-            [
-                "sh",
-                "-c",
-                'if [ -d "$HOME/.claude/projects" ]; then '
-                f'find "$HOME/.claude/projects" -type f \\( -name {session_file} '
-                f"-o -path {subagent_file} \\) -print; fi",
-            ],
-            user=self._user,
+        await self._drain_session_files(command, session_file, subagent_file)
+
+        self._resolve_fork_context_holds()
+        self._native_transcript_drained = True
+        self._flush_pending_events()
+
+    async def _drain_session_files(
+        self, command: str, session_file: str, subagent_file: str
+    ) -> None:
+        """Enumerate and consume the session files, each step under its own bound."""
+        assert self._sandbox is not None  # refresh checked
+        sandbox = self._sandbox
+
+        async def step(what: str, op: Awaitable[T], deadline: float) -> T:
+            # Only THIS scope's expiry is translated. A TimeoutError the provider
+            # raises itself (the K8s exec's in-pod `timeout`, exit 124) is not
+            # ours to rename and propagates with its own message and cause.
+            with anyio.move_on_after(deadline):
+                return await op
+            # Reached only when the scope above cancelled the await.
+            raise RuntimeError(
+                f"Claude native session drain ({command}): {what} did not answer "
+                f"within {deadline:g}s; the sandbox is not answering."
+            )
+
+        result = await step(
+            "enumerating session files",
+            sandbox.exec(
+                [
+                    "sh",
+                    "-c",
+                    'if [ -d "$HOME/.claude/projects" ]; then '
+                    f'find "$HOME/.claude/projects" -type f \\( -name {session_file} '
+                    f"-o -path {subagent_file} \\) -printf '%s\\t%p\\n'; fi",
+                ],
+                user=self._user,
+            ),
+            NATIVE_DRAIN_STEP_TIMEOUT_SECONDS,
         )
         if not result.success:
             raise RuntimeError(
@@ -201,15 +261,26 @@ class LiveConsumer(ModelEventSink):
 
         self._draining_native_session = True
         try:
-            paths = sorted(
-                result.stdout.splitlines(),
-                key=lambda path: "/subagents/agent-" not in path,
-            )
+            sized: list[tuple[str, int]] = []
+            for line in result.stdout.splitlines():
+                size_text, sep, path = line.partition("\t")
+                if not sep or not size_text.isdigit():
+                    raise RuntimeError(
+                        f"Claude session enumeration returned an unreadable line: {line!r}"
+                    )
+                sized.append((path, int(size_text)))
             # Claude mirrors child records in the root session without their
             # agent ID. Consume the authoritative sidecar first so its UUID
             # claims the child response before the mirror is deduplicated.
-            for path in paths:
-                content = await self._sandbox.read_file(path)
+            sized.sort(key=lambda entry: "/subagents/agent-" not in entry[0])
+            for path, size in sized:
+                deadline = (
+                    NATIVE_DRAIN_STEP_TIMEOUT_SECONDS
+                    + size / NATIVE_DRAIN_FLOOR_BYTES_PER_SECOND
+                )
+                content = await step(
+                    f"reading {path} ({size} bytes)", sandbox.read_file(path), deadline
+                )
                 for line in jsonl_lines(content):
                     try:
                         raw = json.loads(line)
@@ -224,10 +295,6 @@ class LiveConsumer(ModelEventSink):
                     self.process_jsonl_line(raw)
         finally:
             self._draining_native_session = False
-
-        self._resolve_fork_context_holds()
-        self._native_transcript_drained = True
-        self._flush_pending_events()
 
     def _resolve_fork_context_holds(self) -> None:
         """Settle every held fork record once the whole drain has been read.

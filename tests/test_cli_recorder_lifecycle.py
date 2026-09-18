@@ -23,6 +23,7 @@ from inspect_ai.util import (
     SandboxEnvironmentConfigType,
     span,
 )
+from inspect_swe._claude_code._events import live_consumer
 from inspect_swe._claude_code._events.live_consumer import LiveConsumer
 from inspect_swe._codex_cli._events.consumer import CodexConsumer
 from inspect_swe._codex_cli._events.detection import COMPACTION_MARKER
@@ -492,8 +493,8 @@ async def test_claude_completion_drain_preserves_stdout_child_parent_owner() -> 
                 success=True,
                 returncode=0,
                 stdout=(
-                    "/home/cc/.claude/projects/project/session.jsonl\n"
-                    "/home/cc/.claude/projects/project/session/subagents/agent-child.jsonl\n"
+                    "1\t/home/cc/.claude/projects/project/session.jsonl\n"
+                    "1\t/home/cc/.claude/projects/project/session/subagents/agent-child.jsonl\n"
                 ),
                 stderr="",
             )
@@ -615,6 +616,210 @@ async def test_claude_completion_drain_preserves_stdout_child_parent_owner() -> 
     assert _span_events(SpanEndEvent) == ["agent-task-child"]
 
 
+def _drain_sandbox(
+    *,
+    paths: list[str],
+    contents: dict[str, str],
+    read_delay: float = 0.0,
+    hang_on: frozenset[str] = frozenset(),
+    exec_hangs: bool = False,
+    exec_raises: Exception | None = None,
+) -> SandboxEnvironment:
+    """A sandbox whose enumeration and reads can be slow, dead, or the provider's own error."""
+    import anyio
+
+    class _Sandbox(SandboxEnvironment):
+        async def exec(
+            self,
+            cmd: list[str],
+            input: str | bytes | None = None,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            user: str | None = None,
+            timeout: int | None = None,
+            timeout_retry: bool = True,
+            concurrency: bool = True,
+        ) -> ExecResult[str]:
+            if exec_raises is not None:
+                raise exec_raises
+            if exec_hangs:
+                await anyio.sleep_forever()
+            listing = "".join(
+                f"{len(contents.get(path, '').encode())}\t{path}\n" for path in paths
+            )
+            return ExecResult(success=True, returncode=0, stdout=listing, stderr="")
+
+        async def write_file(self, file: str, contents: str | bytes) -> None:
+            raise AssertionError(f"unexpected write to {file}")
+
+        @overload
+        async def read_file(self, file: str, text: Literal[True] = True) -> str: ...
+
+        @overload
+        async def read_file(self, file: str, text: Literal[False]) -> bytes: ...
+
+        async def read_file(self, file: str, text: bool = True) -> str | bytes:
+            if file in hang_on:
+                await anyio.sleep_forever()
+            await anyio.sleep(read_delay)
+            return contents[file]
+
+        @classmethod
+        async def sample_cleanup(
+            cls,
+            task_name: str,
+            config: SandboxEnvironmentConfigType | None,
+            environments: dict[str, SandboxEnvironment],
+            interrupted: bool,
+        ) -> None:
+            return None
+
+    return _Sandbox()
+
+
+@pytest.mark.anyio
+async def test_claude_drain_fails_loudly_when_the_sandbox_never_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A teardown drain against a dead pod must end, and say which step died.
+
+    agent-c#19253: hawk's stop interrupted the sample, the recorder's teardown
+    drain then ran `find` in a sandbox whose pod was gone, and the exec never
+    returned. The K8s provider's own `timeout=` runs inside the pod, so a dead
+    pod never fires it; the bound has to be ours.
+    """
+    import anyio
+
+    monkeypatch.setattr(live_consumer, "NATIVE_DRAIN_STEP_TIMEOUT_SECONDS", 0.05)
+    consumer = LiveConsumer()
+    consumer.configure_centaur_session(
+        _drain_sandbox(paths=[], contents={}, exec_hangs=True), "cc", "session"
+    )
+
+    with anyio.fail_after(5):
+        with pytest.raises(
+            RuntimeError, match="enumerating session files did not answer"
+        ):
+            await consumer.refresh("teardown")
+
+
+@pytest.mark.anyio
+async def test_claude_drain_bound_is_per_step_so_a_long_healthy_session_drains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Many slow-but-answering reads must pass: the bound is on progress, not total work.
+
+    The first version of this fix put one budget over the whole drain. Replaying
+    a real 1470-row session with realistic per-read latency took longer than
+    that budget and failed on a HEALTHY sandbox. Here every read is far under
+    the per-step bound while the drain as a whole is far over it.
+    """
+    monkeypatch.setattr(live_consumer, "NATIVE_DRAIN_STEP_TIMEOUT_SECONDS", 0.05)
+    paths = [f"/home/cc/.claude/projects/project/s{i}.jsonl" for i in range(20)]
+    contents = {
+        path: f'{{"uuid":"u{i}","type":"assistant","message":{{"id":"r{i}"}}}}'
+        for i, path in enumerate(paths)
+    }
+    consumer = LiveConsumer()
+    consumer.configure_centaur_session(
+        _drain_sandbox(paths=paths, contents=contents, read_delay=0.02), "cc", None
+    )
+
+    await consumer.refresh(
+        "score"
+    )  # 20 reads x 0.02 s = 0.4 s of work under a 0.05 s step bound
+
+    assert len(consumer._response_agents) == 20
+
+
+@pytest.mark.anyio
+async def test_claude_drain_gives_a_large_file_time_to_arrive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A big session file that is slow but progressing is not a dead pod.
+
+    The provider permits 100 MiB per file, and a fixed per-read wall clock that
+    suits a 4 KiB sidecar would fail a legitimate transfer of one that size.
+    The read's deadline therefore grows with the size the enumeration reported.
+    Here the file takes 4x the floor bound to arrive; sized, it is well inside.
+    """
+    monkeypatch.setattr(live_consumer, "NATIVE_DRAIN_STEP_TIMEOUT_SECONDS", 0.05)
+    # 1 byte per 0.01 s: a 40-byte file may take 0.05 + 0.4 s.
+    monkeypatch.setattr(live_consumer, "NATIVE_DRAIN_FLOOR_BYTES_PER_SECOND", 100.0)
+    path = "/home/cc/.claude/projects/project/big.jsonl"
+    big = '{"uuid":"u","type":"assistant","message":{"id":"r0"}}'.ljust(40)
+    consumer = LiveConsumer()
+    consumer.configure_centaur_session(
+        _drain_sandbox(paths=[path], contents={path: big}, read_delay=0.2), "cc", None
+    )
+
+    await consumer.refresh(
+        "teardown"
+    )  # 0.2 s read against a 0.05 s floor: sized deadline is 0.45 s
+
+    assert "r0" in consumer._response_agents
+
+
+@pytest.mark.anyio
+async def test_claude_drain_names_the_read_that_died_mid_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pod that dies after some files were read fails on that file, by name."""
+    import anyio
+
+    monkeypatch.setattr(live_consumer, "NATIVE_DRAIN_STEP_TIMEOUT_SECONDS", 0.05)
+    paths = [f"/home/cc/.claude/projects/project/s{i}.jsonl" for i in range(3)]
+    contents = {p: '{"uuid":"u","type":"summary"}' for p in paths}
+    consumer = LiveConsumer()
+    consumer.configure_centaur_session(
+        _drain_sandbox(paths=paths, contents=contents, hang_on=frozenset({paths[1]})),
+        "cc",
+        None,
+    )
+
+    # A drain that already read other files may be holding fork records whose
+    # resolution depends on files it has not read yet. Seed one so the
+    # no-settlement assertions below have something to protect.
+    held_record = {"uuid": "held-1", "type": "assistant", "agentId": "agent-held"}
+    consumer._held_fork_records["agent-held"] = held_record
+    held_before = dict(consumer._held_fork_records)
+    with anyio.fail_after(5):
+        with pytest.raises(
+            RuntimeError, match=rf"reading {paths[1]} \(\d+ bytes\) did not answer"
+        ):
+            await consumer.refresh("submit")
+
+    # A drain that died mid-way must not settle held fork records: their
+    # meaning depends on files it never read. They stay exactly as they were,
+    # and the drain is not marked complete.
+    assert consumer._held_fork_records == held_before
+    assert all(
+        consumer._held_fork_records[key] is value for key, value in held_before.items()
+    )
+    assert not consumer._native_transcript_drained
+    assert not consumer._draining_native_session
+
+
+@pytest.mark.anyio
+async def test_claude_drain_leaves_the_providers_own_timeout_error_alone() -> None:
+    """The K8s exec raises TimeoutError itself when its in-pod `timeout` fires.
+
+    That is the provider's verdict with its own message and cause; the drain
+    must not rename it into ours, or a slow-but-alive pod would be reported as
+    dead and the real reason lost.
+    """
+    provider_error = TimeoutError("Command timed out after 30s. ExecResult(...)")
+    consumer = LiveConsumer()
+    consumer.configure_centaur_session(
+        _drain_sandbox(paths=[], contents={}, exec_raises=provider_error), "cc", None
+    )
+
+    with pytest.raises(TimeoutError) as raised:
+        await consumer.refresh("score")
+
+    assert raised.value is provider_error
+
+
 @pytest.mark.anyio
 async def test_claude_unpinned_drain_reads_every_session_in_the_sandbox() -> None:
     """An interactive operator may start several `claude` sessions; drain them all.
@@ -643,9 +848,9 @@ async def test_claude_unpinned_drain_reads_every_session_in_the_sandbox() -> Non
                 success=True,
                 returncode=0,
                 stdout=(
-                    "/home/cc/.claude/projects/project/first.jsonl\n"
-                    "/home/cc/.claude/projects/project/second.jsonl\n"
-                    "/home/cc/.claude/projects/project/second/subagents/agent-kid.jsonl\n"
+                    "1\t/home/cc/.claude/projects/project/first.jsonl\n"
+                    "1\t/home/cc/.claude/projects/project/second.jsonl\n"
+                    "1\t/home/cc/.claude/projects/project/second/subagents/agent-kid.jsonl\n"
                 ),
                 stderr="",
             )
@@ -740,7 +945,7 @@ async def test_claude_drain_reads_records_carrying_unicode_line_separators() -> 
             return ExecResult(
                 success=True,
                 returncode=0,
-                stdout="/home/cc/.claude/projects/project/only.jsonl\n",
+                stdout="1\t/home/cc/.claude/projects/project/only.jsonl\n",
                 stderr="",
             )
 

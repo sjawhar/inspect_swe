@@ -324,15 +324,17 @@ def test_run_centaur_preserves_cancellation_when_recorder_finalization_fails(
         del kwargs
         return "human-cli-agent"
 
+    cancellation = asyncio.CancelledError()
+
     async def cancelled_run(agent: object, state: AgentState) -> AgentState:
         assert agent == "human-cli-agent"
         assert state is session.state
-        raise asyncio.CancelledError()
+        raise cancellation
 
     monkeypatch.setattr(centaur_mod, "human_cli", fake_human_cli)
     monkeypatch.setattr(centaur_mod, "run", cancelled_run)
 
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(asyncio.CancelledError) as raised:
         asyncio.run(
             run_centaur(
                 CentaurOptions(),
@@ -342,6 +344,9 @@ def test_run_centaur_preserves_cancellation_when_recorder_finalization_fails(
             )
         )
 
+    # The session's own failure reaches the caller unchanged: not the
+    # finalization RuntimeError, and not a copy of the cancellation either.
+    assert raised.value is cancellation
     assert calls == ["finalize"]
 
 
