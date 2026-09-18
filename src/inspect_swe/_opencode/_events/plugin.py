@@ -2,6 +2,8 @@
 
 import json
 
+from ..._util.jsonl import jsonl_lines
+
 OPENCODE_COMPACTION_PLUGIN = r"""import { appendFileSync } from "node:fs"
 
 export default async function inspectSWECompactionPlugin(_input, options) {
@@ -17,7 +19,7 @@ export default async function inspectSWECompactionPlugin(_input, options) {
       if (typeof sessionID !== "string" || sessionID.length === 0) {
         throw new Error("OpenCode session.compacted event is missing sessionID")
       }
-      appendFileSync(eventLog, JSON.stringify({ type: event.type, properties: { sessionID } }) + "\\n", "utf8")
+      appendFileSync(eventLog, JSON.stringify({ type: event.type, properties: { sessionID } }) + "\n", "utf8")
     },
   }
 }
@@ -43,9 +45,7 @@ class AppendOnlyCompactionLog:
 def compaction_events(payload: str) -> list[dict[str, object]]:
     """Parse the newline-delimited records emitted by the configured plugin."""
     events: list[dict[str, object]] = []
-    for line_number, line in enumerate(payload.splitlines(), start=1):
-        if not line:
-            continue
+    for line_number, line in enumerate(jsonl_lines(payload), start=1):
         try:
             event = json.loads(line)
         except json.JSONDecodeError as error:

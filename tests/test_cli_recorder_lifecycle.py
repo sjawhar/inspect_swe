@@ -1,3 +1,4 @@
+import json
 from collections.abc import Iterator
 from typing import Literal, overload
 
@@ -410,6 +411,83 @@ async def test_claude_unpinned_drain_reads_every_session_in_the_sandbox() -> Non
     assert "'*/*/subagents/agent-*.jsonl'" in commands[0]
     # Sidecar first (it claims the child response), then both roots.
     assert [raw["summary"] for raw in seen] == ["kid", "first", "second"]
+
+
+@pytest.mark.anyio
+async def test_claude_drain_reads_records_carrying_unicode_line_separators() -> None:
+    """A record's own text may contain U+2028/U+2029/U+0085; those are not delimiters.
+
+    Claude writes each record with `JSON.stringify`, which leaves those code points
+    raw inside string values. Only the newline between records separates them; a
+    live session died at `score` because the drain split on them too.
+    """
+    content = "compacted\u2028then\u2029resumed\u0085here"
+    payload = json.dumps(
+        {
+            "type": "system",
+            "uuid": "a2a0d9ee-4f38-4d8b-9a83-6e9c1e9f1d21",
+            "subtype": "compact_boundary",
+            "content": content,
+            "compactMetadata": {"trigger": "manual", "preTokens": 123},
+        },
+        ensure_ascii=False,
+    )
+    assert "\u2028" in payload
+
+    class _Sandbox(SandboxEnvironment):
+        async def exec(
+            self,
+            cmd: list[str],
+            input: str | bytes | None = None,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            user: str | None = None,
+            timeout: int | None = None,
+            timeout_retry: bool = True,
+            concurrency: bool = True,
+        ) -> ExecResult[str]:
+            return ExecResult(
+                success=True,
+                returncode=0,
+                stdout="/home/cc/.claude/projects/project/only.jsonl\n",
+                stderr="",
+            )
+
+        async def write_file(self, file: str, contents: str | bytes) -> None:
+            raise AssertionError(f"unexpected write to {file}")
+
+        @overload
+        async def read_file(self, file: str, text: Literal[True] = True) -> str: ...
+
+        @overload
+        async def read_file(self, file: str, text: Literal[False]) -> bytes: ...
+
+        async def read_file(self, file: str, text: bool = True) -> str | bytes:
+            if not text:
+                raise AssertionError(f"unexpected binary read of {file}")
+            return f"{payload}\n"
+
+        @classmethod
+        async def sample_cleanup(
+            cls,
+            task_name: str,
+            config: SandboxEnvironmentConfigType | None,
+            environments: dict[str, SandboxEnvironment],
+            interrupted: bool,
+        ) -> None:
+            return None
+
+    consumer = LiveConsumer()
+    consumer.configure_centaur_session(_Sandbox(), "cc", None)
+
+    await consumer.refresh("score")
+
+    compactions = [
+        event for event in transcript().events if isinstance(event, CompactionEvent)
+    ]
+    assert len(compactions) == 1
+    assert compactions[0].tokens_before == 123
+    assert compactions[0].metadata == {"trigger": "manual", "content": content}
 
 
 @pytest.mark.parametrize(

@@ -32,6 +32,7 @@ from inspect_ai.model._model_output import StopReason
 from inspect_ai.util import SandboxEnvironment
 from inspect_ai.util._span import current_span_id
 
+from ..._util.jsonl import jsonl_lines
 from .toolview import tool_view
 
 # Match the native parser's typed conversation domain. Session JSONL also
@@ -187,9 +188,7 @@ class LiveConsumer(ModelEventSink):
             # claims the child response before the mirror is deduplicated.
             for path in paths:
                 content = await self._sandbox.read_file(path)
-                for line in content.splitlines():
-                    if not line:
-                        continue
+                for line in jsonl_lines(content):
                     try:
                         raw = json.loads(line)
                     except json.JSONDecodeError as ex:

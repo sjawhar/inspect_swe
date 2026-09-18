@@ -5,8 +5,10 @@ documented ``task`` tool-result envelope. They are intentionally not acceptance
 evidence: LocalHarness drives the real CLI/bridge path separately.
 """
 
+import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 from inspect_ai.event import CompactionEvent, SpanBeginEvent, SpanEndEvent
@@ -21,6 +23,7 @@ from inspect_swe._opencode._events.identity import (
     request_identity,
 )
 from inspect_swe._opencode._events.plugin import (
+    OPENCODE_COMPACTION_PLUGIN,
     AppendOnlyCompactionLog,
     compaction_events,
 )
@@ -195,6 +198,38 @@ def test_append_only_plugin_log_preserves_events_appended_after_prior_drain() ->
     assert event_log.drain(first + second) == compaction_events(second)
     with pytest.raises(RuntimeError, match="append-only"):
         event_log.drain("")
+
+
+def test_plugin_writes_records_the_reader_can_parse(tmp_path: Path) -> None:
+    r"""The plugin's own output must drain; a hand-written fixture cannot prove it.
+
+    The plugin source is a Python raw string, so a JavaScript `"\\n"` in it
+    appends a literal backslash-n and every record lands on one physical line.
+    Drive the real plugin and read what it actually wrote.
+    """
+    plugin = tmp_path / "plugin.mjs"
+    plugin.write_text(OPENCODE_COMPACTION_PLUGIN, encoding="utf-8")
+    event_log = tmp_path / "events.jsonl"
+    driver = tmp_path / "driver.mjs"
+    driver.write_text(
+        f"const plugin = (await import({str(plugin)!r})).default;\n"
+        f"const handlers = await plugin(null, {{ eventLog: {str(event_log)!r} }});\n"
+        "for (const sessionID of ['ses_first', 'ses_second']) {\n"
+        "  await handlers.event({ event: { type: 'session.compacted',"
+        " properties: { sessionID } } });\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["node", str(driver)], check=False, capture_output=True, text=True
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert compaction_events(event_log.read_text(encoding="utf-8")) == [
+        {"type": "session.compacted", "properties": {"sessionID": "ses_first"}},
+        {"type": "session.compacted", "properties": {"sessionID": "ses_second"}},
+    ]
 
 
 def test_plugin_compaction_event_marks_the_closed_native_child_span() -> None:
