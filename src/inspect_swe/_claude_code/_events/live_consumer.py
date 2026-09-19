@@ -19,6 +19,7 @@ stream-json stdout channel does not include child-session records.
 """
 
 import json
+import logging
 import shlex
 from collections.abc import Awaitable
 from dataclasses import dataclass
@@ -34,8 +35,10 @@ from inspect_ai.model._model_output import StopReason
 from inspect_ai.util import SandboxEnvironment
 from inspect_ai.util._span import current_span_id
 
-from ..._util.jsonl import jsonl_lines
+from ..._util.jsonl import jsonl_records
 from .toolview import tool_view
+
+logger = logging.getLogger(__name__)
 
 # Match the native parser's typed conversation domain. Session JSONL also
 # persists heterogeneous scheduler and attachment metadata, which has no
@@ -281,10 +284,23 @@ class LiveConsumer(ModelEventSink):
                 content = await step(
                     f"reading {path} ({size} bytes)", sandbox.read_file(path), deadline
                 )
-                for line in jsonl_lines(content):
+                for line, terminated in jsonl_records(content):
                     try:
                         raw = json.loads(line)
                     except json.JSONDecodeError as ex:
+                        if not terminated:
+                            # Claude Code is still appending: the final segment has
+                            # no newline yet because its write is in flight. It is
+                            # the whole record on the next drain; nothing follows
+                            # it in this read. An interior malformed record is
+                            # real corruption and still raises below.
+                            logger.debug(
+                                "Skipping an unterminated trailing record in %s "
+                                "(%d bytes): write in flight, read on the next drain.",
+                                path,
+                                len(line),
+                            )
+                            break
                         raise RuntimeError(
                             f"Malformed Claude session JSONL in {path}."
                         ) from ex

@@ -986,6 +986,119 @@ async def test_claude_drain_reads_records_carrying_unicode_line_separators() -> 
     assert compactions[0].metadata == {"trigger": "manual", "content": content}
 
 
+def _single_session_sandbox(content: str) -> SandboxEnvironment:
+    """A sandbox holding one Claude session file whose text is `content`."""
+
+    class _Sandbox(SandboxEnvironment):
+        async def exec(
+            self,
+            cmd: list[str],
+            input: str | bytes | None = None,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            user: str | None = None,
+            timeout: int | None = None,
+            timeout_retry: bool = True,
+            concurrency: bool = True,
+        ) -> ExecResult[str]:
+            return ExecResult(
+                success=True,
+                returncode=0,
+                stdout=f"{len(content)}\t/home/cc/.claude/projects/project/only.jsonl\n",
+                stderr="",
+            )
+
+        async def write_file(self, file: str, contents: str | bytes) -> None:
+            raise AssertionError(f"unexpected write to {file}")
+
+        @overload
+        async def read_file(self, file: str, text: Literal[True] = True) -> str: ...
+
+        @overload
+        async def read_file(self, file: str, text: Literal[False]) -> bytes: ...
+
+        async def read_file(self, file: str, text: bool = True) -> str | bytes:
+            if not text:
+                raise AssertionError(f"unexpected binary read of {file}")
+            return content
+
+        @classmethod
+        async def sample_cleanup(
+            cls,
+            task_name: str,
+            config: SandboxEnvironmentConfigType | None,
+            environments: dict[str, SandboxEnvironment],
+            interrupted: bool,
+        ) -> None:
+            return None
+
+    return _Sandbox()
+
+
+_COMPACTION = json.dumps(
+    {
+        "type": "system",
+        "uuid": "2f1e9a4c-6f0e-4a55-9d0f-0d6a1c9f3b77",
+        "subtype": "compact_boundary",
+        "content": "boundary",
+        "compactMetadata": {"trigger": "auto", "preTokens": 7},
+    }
+)
+
+
+@pytest.mark.anyio
+async def test_claude_drain_skips_a_torn_trailing_record_of_a_live_session() -> None:
+    """Reading a session Claude Code is still appending to catches a half-written record.
+
+    A red-teamer's `task score` died with `Malformed Claude session JSONL` on a file
+    that parsed cleanly a moment later: the drain read it between the writer's
+    `write()` and its trailing newline. A final segment no newline closed is a
+    write in flight, not corruption; the next drain reads the whole record.
+    """
+    torn = '{"type":"assistant","uuid":"9b1d","message":{"role":"assistant","con'
+    consumer = LiveConsumer()
+    consumer.configure_centaur_session(
+        _single_session_sandbox(f"{_COMPACTION}\n{torn}"), "cc", None
+    )
+
+    await consumer.refresh("score")
+
+    compactions = [
+        event for event in transcript().events if isinstance(event, CompactionEvent)
+    ]
+    assert len(compactions) == 1, "the complete record before the torn tail is consumed"
+
+
+@pytest.mark.anyio
+async def test_claude_drain_still_raises_on_an_interior_malformed_record() -> None:
+    """Only the unterminated tail is forgiven; a broken record inside the file is corruption."""
+    consumer = LiveConsumer()
+    consumer.configure_centaur_session(
+        _single_session_sandbox(
+            f'{{"type":"assistant","uuid":"9b1d","message":\n{_COMPACTION}\n'
+        ),
+        "cc",
+        None,
+    )
+
+    with pytest.raises(RuntimeError, match="Malformed Claude session JSONL"):
+        await consumer.refresh("score")
+
+
+@pytest.mark.anyio
+async def test_claude_drain_consumes_a_complete_unterminated_final_record() -> None:
+    """A final record that parses is consumed even when no newline follows it yet."""
+    consumer = LiveConsumer()
+    consumer.configure_centaur_session(_single_session_sandbox(_COMPACTION), "cc", None)
+
+    await consumer.refresh("score")
+
+    compactions = [
+        event for event in transcript().events if isinstance(event, CompactionEvent)
+    ]
+    assert len(compactions) == 1
+
+
 @pytest.mark.parametrize(
     "raw",
     (
