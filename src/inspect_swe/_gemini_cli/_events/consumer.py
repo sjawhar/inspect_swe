@@ -19,9 +19,10 @@ from typing import Protocol, TypeAlias
 from inspect_ai.event import CompactionEvent, SpanBeginEvent, SpanEndEvent
 from inspect_ai.event._model import ModelEvent
 from inspect_ai.log import transcript
-from inspect_ai.model import BRIDGE_REQUEST_HEADERS
 from inspect_ai.model._model import ModelEventSink
 from inspect_ai.util._span import current_span_id
+
+from ..._util.inspect_compat import BRIDGE_REQUEST_HEADERS
 
 _JsonObject: TypeAlias = dict[str, object]
 _HrTime: TypeAlias = tuple[int, int]

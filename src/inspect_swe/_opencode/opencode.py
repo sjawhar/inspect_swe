@@ -16,7 +16,6 @@ from inspect_ai.agent import (
 )
 from inspect_ai.event import ModelEvent
 from inspect_ai.model import (
-    BRIDGE_REQUEST_HEADERS,
     ChatMessageSystem,
     GenerateFilter,
     Model,
@@ -44,6 +43,7 @@ from inspect_swe._util.messages import build_user_prompt
 from inspect_swe._util.sandbox import resolve_agent_cwd
 from inspect_swe._util.trace import trace
 
+from .._util.inspect_compat import BRIDGE_REQUEST_HEADERS
 from ._events.consumer import OpenCodeConsumer
 from ._events.identity import OpenCodeRequestIdentity, request_identity
 from ._events.plugin import (

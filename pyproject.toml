@@ -15,7 +15,12 @@ requires-python = ">=3.10"
 license = { text = "MIT License" }
 dependencies = [
     "httpx",
-    "inspect_ai>=0.3.255",
+    # >=0.3.264 is the first upstream release exporting every symbol imported at
+    # module scope (ModelResolver arrived after 0.3.255); the .dev0 form keeps the
+    # trajectory-labs inspect_ai fork admitted -- its builds version as the NEXT
+    # upstream release's dev pre-release (e.g. 0.3.264.dev201+upstream.g8984b671d),
+    # which a plain >=0.3.264 would reject.
+    "inspect_ai>=0.3.264.dev0",
     "nest_asyncio",
     "platformdirs",
     "pydantic>=2.13.0",
@@ -94,6 +99,21 @@ ignore = ["E203", "E501", "D10", "D212", "D415"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
+
+[dependency-groups]
+# Root-only by construction (PEP 735 groups never enter published metadata).
+# NOT a tool.uv.sources entry: uv applies a git dependency's sources to that
+# dependency's consumers, which would hand every project installing this fork a
+# second inspect-ai URL and the "conflicting URLs for package inspect-ai"
+# resolution failure the moment the inspect_ai fork release moves. This group
+# only pairs the dev venv (uv sync installs it by default) with the fork
+# inspect_ai the runtime surface (bridge kwargs, human_cli extensions) is written
+# against, so make check and pytest exercise the shipped pairing. The import-time
+# surface tolerates upstream inspect-ai independently (_util/inspect_compat.py).
+# Move the rev deliberately with the inspect_ai fork release; never a branch name.
+dev = [
+    "inspect-ai @ git+https://github.com/trajectory-labs-pbc/inspect_ai.git@8984b671da647ef278fe9bd86c3633c664773d6d",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

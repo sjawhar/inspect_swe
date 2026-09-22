@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 from inspect_ai.agent import AgentState
 from inspect_ai.event._model import ModelEvent
-from inspect_ai.model import BRIDGE_REQUEST_HEADERS, GenerateConfig, ModelOutput
+from inspect_ai.model import GenerateConfig, ModelOutput
 from inspect_ai.util._sandbox import ExecRemoteAwaitableOptions
 from inspect_swe._gemini_cli._events.consumer import GeminiConsumer
 from inspect_swe._gemini_cli.gemini_cli import _unattended_gemini_command
@@ -20,6 +20,7 @@ from inspect_swe._util.centaur import (
     CentaurSession,
     reset_recorder_preserving_session_exception,
 )
+from inspect_swe._util.inspect_compat import BRIDGE_REQUEST_HEADERS
 
 
 def test_unattended_command_constructs_headless_argv_after_resume() -> None:

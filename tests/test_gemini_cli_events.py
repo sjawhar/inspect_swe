@@ -9,8 +9,9 @@ import inspect_swe._gemini_cli._events.consumer as consumer_module
 import pytest
 from inspect_ai.event import CompactionEvent, SpanBeginEvent, SpanEndEvent
 from inspect_ai.event._model import ModelEvent
-from inspect_ai.model import BRIDGE_REQUEST_HEADERS, GenerateConfig, ModelOutput
+from inspect_ai.model import GenerateConfig, ModelOutput
 from inspect_swe._gemini_cli._events.consumer import GeminiConsumer
+from inspect_swe._util.inspect_compat import BRIDGE_REQUEST_HEADERS
 
 
 @dataclass
