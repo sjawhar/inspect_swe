@@ -18,10 +18,12 @@ interactive `/compact` is recorded even though the shell's unattended
 stream-json stdout channel does not include child-session records.
 """
 
+import functools
 import json
 import logging
 import shlex
-from collections.abc import Awaitable
+import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
@@ -65,17 +67,33 @@ T = TypeVar("T")
 # while a dead pod -- the case this exists for, agent-c#19253: hawk's stop had
 # interrupted the sample, the pod was gone, the teardown drain's exec never
 # returned, and the runner reported the run live for 15 and 25 hours -- still
-# fails within the floor on the enumeration or any ordinary file.
+# fails in bounded time: each attempt within the floor on the enumeration or any
+# ordinary file, retried until an expiry finds `NATIVE_DRAIN_RIDE_THROUGH_SECONDS`
+# (below) spent -- so up to one more attempt, with its settle, past that budget.
 #
 # The bound has to live here, client-side: the K8s provider's own `timeout=`
 # runs the `timeout` binary inside the pod, which a dead pod never executes,
 # `read_file` takes no deadline at all, and its websocket read blocks with
-# none. Cancelling our await does not unblock the provider's worker thread; on
-# a dead pod that thread stays parked on a socket that will never answer. One
-# parked thread per abandoned step is the residual cost of not hanging forever;
-# closing it needs a deadline inside the provider's transport, not here.
+# none. Cancelling our await does not by itself unblock the provider's worker
+# thread: the K8s provider closes a cancelled operation's transport and then
+# waits up to 30 s for that worker to finish before the cancellation unwinds.
+# So every expired attempt costs up to one such settle before the retry below
+# issues the step again, and retries settle one at a time, never in parallel.
+# A worker that does not finish within its settle stays parked on its thread,
+# so a transport that never wakes parks up to one pool worker per attempt --
+# about ten per step at the defaults -- rather than the one it parked before
+# the retry existed.
 NATIVE_DRAIN_STEP_TIMEOUT_SECONDS: float = 60.0
 NATIVE_DRAIN_FLOOR_BYTES_PER_SECOND: float = 256 * 1024
+
+# A step that stops answering mid-drain is retried (every step is a read-only
+# listing or file read, safe to repeat) until the sandbox answers again or an
+# expiry finds this budget spent. The budget is counted from the first expiry,
+# not from the step's start: the attempt in flight when a stall begins has
+# already spent its deadline. A dead pod therefore fails after the budget rather
+# than at the first expiry; 0 disables the retry.
+NATIVE_DRAIN_RIDE_THROUGH_SECONDS: float = 900.0
+NATIVE_DRAIN_RETRY_WAIT_SECONDS: float = 5.0
 
 # Distinguishes "root owns this response" (None) from "nobody has claimed it".
 _UNSET = object()
@@ -231,21 +249,43 @@ class LiveConsumer(ModelEventSink):
         assert self._sandbox is not None  # refresh checked
         sandbox = self._sandbox
 
-        async def step(what: str, op: Awaitable[T], deadline: float) -> T:
+        async def step(what: str, op: Callable[[], Awaitable[T]], deadline: float) -> T:
             # Only THIS scope's expiry is translated. A TimeoutError the provider
             # raises itself (the K8s exec's in-pod `timeout`, exit 124) is not
-            # ours to rename and propagates with its own message and cause.
-            with anyio.move_on_after(deadline):
-                return await op
-            # Reached only when the scope above cancelled the await.
-            raise RuntimeError(
-                f"Claude native session drain ({command}): {what} did not answer "
-                f"within {deadline:g}s; the sandbox is not answering."
-            )
+            # ours to rename and propagates with its own message and cause, and
+            # an outer cancellation passes straight through the scope below: only
+            # our own deadline expiring counts as a stall worth riding out.
+            ride_through_deadline: float | None = None
+            while True:
+                with anyio.move_on_after(deadline):
+                    return await op()
+                # Reached only when the scope above cancelled the await.
+                now = time.monotonic()
+                if ride_through_deadline is None:
+                    ride_through_deadline = now + NATIVE_DRAIN_RIDE_THROUGH_SECONDS
+                if now >= ride_through_deadline:
+                    raise RuntimeError(
+                        f"Claude native session drain ({command}): {what} did not answer "
+                        f"within {deadline:g}s per attempt over "
+                        f"{NATIVE_DRAIN_RIDE_THROUGH_SECONDS:g}s of retries; the sandbox "
+                        "is not answering."
+                    )
+                logger.warning(
+                    "Claude native session drain (%s): %s did not answer within %gs; "
+                    "%.0fs of the retry budget left",
+                    command,
+                    what,
+                    deadline,
+                    ride_through_deadline - now,
+                )
+                await anyio.sleep(NATIVE_DRAIN_RETRY_WAIT_SECONDS)
+
+        async def read_text(path: str) -> str:
+            return await sandbox.read_file(path)
 
         result = await step(
             "enumerating session files",
-            sandbox.exec(
+            lambda: sandbox.exec(
                 [
                     "sh",
                     "-c",
@@ -282,7 +322,9 @@ class LiveConsumer(ModelEventSink):
                     + size / NATIVE_DRAIN_FLOOR_BYTES_PER_SECOND
                 )
                 content = await step(
-                    f"reading {path} ({size} bytes)", sandbox.read_file(path), deadline
+                    f"reading {path} ({size} bytes)",
+                    functools.partial(read_text, path),
+                    deadline,
                 )
                 for line, terminated in jsonl_records(content):
                     try:

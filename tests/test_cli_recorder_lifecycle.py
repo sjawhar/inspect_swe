@@ -1,5 +1,5 @@
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import Literal, overload
 
 import pytest
@@ -624,9 +624,21 @@ def _drain_sandbox(
     hang_on: frozenset[str] = frozenset(),
     exec_hangs: bool = False,
     exec_raises: Exception | None = None,
+    exec_hangs_first: int = 0,
+    hang_first_reads: Mapping[str, int] | None = None,
+    calls: dict[str, int] | None = None,
 ) -> SandboxEnvironment:
-    """A sandbox whose enumeration and reads can be slow, dead, or the provider's own error."""
+    """A sandbox whose enumeration and reads can be slow, dead, or the provider's own error.
+
+    `exec_hangs_first` hangs the first N enumerations and then answers;
+    `hang_first_reads` hangs the first N reads of a path and then answers. When
+    given, `calls` counts every enumeration (under "exec") and every read (under
+    its path), so a test can see how many attempts each step took.
+    """
     import anyio
+
+    counts = calls if calls is not None else {}
+    first_reads = dict(hang_first_reads or {})
 
     class _Sandbox(SandboxEnvironment):
         async def exec(
@@ -640,9 +652,10 @@ def _drain_sandbox(
             timeout_retry: bool = True,
             concurrency: bool = True,
         ) -> ExecResult[str]:
+            counts["exec"] = counts.get("exec", 0) + 1
             if exec_raises is not None:
                 raise exec_raises
-            if exec_hangs:
+            if exec_hangs or counts["exec"] <= exec_hangs_first:
                 await anyio.sleep_forever()
             listing = "".join(
                 f"{len(contents.get(path, '').encode())}\t{path}\n" for path in paths
@@ -659,7 +672,8 @@ def _drain_sandbox(
         async def read_file(self, file: str, text: Literal[False]) -> bytes: ...
 
         async def read_file(self, file: str, text: bool = True) -> str | bytes:
-            if file in hang_on:
+            counts[file] = counts.get(file, 0) + 1
+            if file in hang_on or counts[file] <= first_reads.get(file, 0):
                 await anyio.sleep_forever()
             await anyio.sleep(read_delay)
             return contents[file]
@@ -691,9 +705,13 @@ async def test_claude_drain_fails_loudly_when_the_sandbox_never_answers(
     import anyio
 
     monkeypatch.setattr(live_consumer, "NATIVE_DRAIN_STEP_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(live_consumer, "NATIVE_DRAIN_RIDE_THROUGH_SECONDS", 0.0)
+    calls: dict[str, int] = {}
     consumer = LiveConsumer()
     consumer.configure_centaur_session(
-        _drain_sandbox(paths=[], contents={}, exec_hangs=True), "cc", "session"
+        _drain_sandbox(paths=[], contents={}, exec_hangs=True, calls=calls),
+        "cc",
+        "session",
     )
 
     with anyio.fail_after(5):
@@ -701,6 +719,9 @@ async def test_claude_drain_fails_loudly_when_the_sandbox_never_answers(
             RuntimeError, match="enumerating session files did not answer"
         ):
             await consumer.refresh("teardown")
+
+    # With the ride-through disabled the first expiry is final: no retry.
+    assert calls["exec"] == 1
 
 
 @pytest.mark.anyio
@@ -768,11 +789,18 @@ async def test_claude_drain_names_the_read_that_died_mid_drain(
     import anyio
 
     monkeypatch.setattr(live_consumer, "NATIVE_DRAIN_STEP_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(live_consumer, "NATIVE_DRAIN_RIDE_THROUGH_SECONDS", 0.0)
     paths = [f"/home/cc/.claude/projects/project/s{i}.jsonl" for i in range(3)]
     contents = {p: '{"uuid":"u","type":"summary"}' for p in paths}
+    calls: dict[str, int] = {}
     consumer = LiveConsumer()
     consumer.configure_centaur_session(
-        _drain_sandbox(paths=paths, contents=contents, hang_on=frozenset({paths[1]})),
+        _drain_sandbox(
+            paths=paths,
+            contents=contents,
+            hang_on=frozenset({paths[1]}),
+            calls=calls,
+        ),
         "cc",
         None,
     )
@@ -798,6 +826,8 @@ async def test_claude_drain_names_the_read_that_died_mid_drain(
     )
     assert not consumer._native_transcript_drained
     assert not consumer._draining_native_session
+    # With the ride-through disabled the dead read was attempted exactly once.
+    assert calls[paths[1]] == 1
 
 
 @pytest.mark.anyio
@@ -808,16 +838,140 @@ async def test_claude_drain_leaves_the_providers_own_timeout_error_alone() -> No
     must not rename it into ours, or a slow-but-alive pod would be reported as
     dead and the real reason lost.
     """
+    import anyio
+
     provider_error = TimeoutError("Command timed out after 30s. ExecResult(...)")
+    calls: dict[str, int] = {}
     consumer = LiveConsumer()
     consumer.configure_centaur_session(
-        _drain_sandbox(paths=[], contents={}, exec_raises=provider_error), "cc", None
+        _drain_sandbox(paths=[], contents={}, exec_raises=provider_error, calls=calls),
+        "cc",
+        None,
     )
 
-    with pytest.raises(TimeoutError) as raised:
-        await consumer.refresh("score")
+    # The default ride-through budget is left in place: a provider verdict must
+    # propagate at once, never be retried as if it were our own expiry.
+    with anyio.fail_after(5):
+        with pytest.raises(TimeoutError) as raised:
+            await consumer.refresh("score")
 
     assert raised.value is provider_error
+    assert calls["exec"] == 1
+
+
+@pytest.mark.anyio
+async def test_claude_drain_rides_through_a_stalled_step_and_completes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A step that stops answering mid-drain is retried while the sandbox recovers.
+
+    A hosted session lost its runner to a seven-minute exec stall on a pod that
+    stayed alive: execs issued during the stall never answered, and fresh ones
+    issued after it did. A drain landing in that window must wait it out, and it
+    can, because every step is a read-only listing or file read, safe to repeat.
+    """
+    import anyio
+
+    monkeypatch.setattr(live_consumer, "NATIVE_DRAIN_STEP_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(live_consumer, "NATIVE_DRAIN_RIDE_THROUGH_SECONDS", 5.0)
+    monkeypatch.setattr(live_consumer, "NATIVE_DRAIN_RETRY_WAIT_SECONDS", 0.0)
+    path = "/home/cc/.claude/projects/project/s.jsonl"
+    calls: dict[str, int] = {}
+    sandbox = _drain_sandbox(
+        paths=[path],
+        contents={path: '{"uuid":"u1","type":"assistant","message":{"id":"r1"}}'},
+        exec_hangs_first=2,
+        hang_first_reads={path: 1},
+        calls=calls,
+    )
+    consumer = LiveConsumer()
+    consumer.configure_centaur_session(sandbox, "cc", None)
+
+    with anyio.fail_after(5):
+        await consumer.refresh("teardown")
+
+    assert "r1" in consumer._response_agents
+    assert calls["exec"] == 3
+    assert calls[path] == 2
+
+
+@pytest.mark.anyio
+async def test_claude_drain_fails_loudly_when_the_stall_outlasts_the_ride_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sandbox that never answers again still fails, naming both bounds."""
+    import anyio
+
+    monkeypatch.setattr(live_consumer, "NATIVE_DRAIN_STEP_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(live_consumer, "NATIVE_DRAIN_RIDE_THROUGH_SECONDS", 0.3)
+    monkeypatch.setattr(live_consumer, "NATIVE_DRAIN_RETRY_WAIT_SECONDS", 0.0)
+    calls: dict[str, int] = {}
+    sandbox = _drain_sandbox(paths=[], contents={}, exec_hangs=True, calls=calls)
+    consumer = LiveConsumer()
+    consumer.configure_centaur_session(sandbox, "cc", "session")
+
+    with anyio.fail_after(5):
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                r"enumerating session files did not answer within 0\.05s per "
+                r"attempt over 0\.3s of retries; the sandbox is not answering"
+            ),
+        ):
+            await consumer.refresh("teardown")
+
+    assert calls["exec"] >= 2
+
+
+@pytest.mark.anyio
+async def test_claude_drain_ride_through_budget_starts_at_the_first_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The retry budget covers the stall after the first expiry, not the attempt before it.
+
+    The attempt already in flight when a sandbox stalls spends its whole deadline
+    before anything is known; the budget is what remains to ride out after that.
+    Here the third attempt answers 1.0 s in: inside a 0.8 s budget counted from
+    the first expiry (0.5 s), outside one counted from the step's start.
+    """
+    import anyio
+
+    monkeypatch.setattr(live_consumer, "NATIVE_DRAIN_STEP_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(live_consumer, "NATIVE_DRAIN_RIDE_THROUGH_SECONDS", 0.8)
+    monkeypatch.setattr(live_consumer, "NATIVE_DRAIN_RETRY_WAIT_SECONDS", 0.0)
+    calls: dict[str, int] = {}
+    sandbox = _drain_sandbox(paths=[], contents={}, exec_hangs_first=2, calls=calls)
+    consumer = LiveConsumer()
+    consumer.configure_centaur_session(sandbox, "cc", "session")
+
+    with anyio.fail_after(5):
+        await consumer.refresh("teardown")
+
+    assert calls["exec"] == 3
+
+
+@pytest.mark.anyio
+async def test_claude_drain_retry_does_not_outlive_an_outer_cancellation() -> None:
+    """An outer cancellation ends the drain at once; it is never ridden through.
+
+    A teardown that runs inside an already-cancelled scope must still unwind
+    promptly, so only the step's own deadline expiring counts as a stall.
+    """
+    import anyio
+
+    sandbox = _drain_sandbox(paths=[], contents={}, exec_hangs=True)
+    consumer = LiveConsumer()
+    consumer.configure_centaur_session(sandbox, "cc", "session")
+
+    # The default step deadline and ride-through budget are left in place: the
+    # cancellation, not either bound, must be what ends this drain, and at once.
+    started = anyio.current_time()
+    with anyio.fail_after(5):
+        with anyio.move_on_after(0.5) as scope:
+            await consumer.refresh("teardown")
+
+    assert scope.cancelled_caught
+    assert anyio.current_time() - started < 5
 
 
 @pytest.mark.anyio
