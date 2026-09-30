@@ -29,6 +29,7 @@ from inspect_ai.util import sandbox as sandbox_env
 from inspect_ai.util import store
 from inspect_ai.util._sandbox import ExecRemoteAwaitableOptions
 
+from inspect_swe._util.jsonl import jsonl_lines
 from inspect_swe._util.mcp_ready import (
     DEFAULT_MCP_READY_TIMEOUT,
     wait_for_mcp_endpoints,
@@ -501,7 +502,7 @@ def antigravity(
 
 def _reported_conversation_id(stdout: str) -> str | None:
     """Extract the SDK conversation id from the runner's JSON result line."""
-    for line in reversed(stdout.strip().splitlines()):
+    for line in reversed(list(jsonl_lines(stdout.strip()))):
         line = line.strip()
         if not line.startswith("{"):
             continue
@@ -518,7 +519,7 @@ def _reported_conversation_id(stdout: str) -> str | None:
 
 def _runner_result_line(stdout: str) -> dict[str, object] | None:
     """Parse the runner's JSON result line (the last JSON object it printed)."""
-    for line in reversed(stdout.strip().splitlines()):
+    for line in reversed(list(jsonl_lines(stdout.strip()))):
         line = line.strip()
         if not line.startswith("{"):
             continue

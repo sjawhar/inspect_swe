@@ -144,6 +144,24 @@ def test_reported_conversation_id_tolerates_missing_or_bad_output() -> None:
     )
 
 
+def test_result_line_readers_tolerate_unicode_line_separators() -> None:
+    r"""Model-authored strings reach the result line; only `\n` separates lines."""
+    stdout = "\n".join(
+        (
+            "harness noise",
+            json.dumps(
+                {
+                    "conversation_id": "conv-123",
+                    "view_file_unexpected_arg_keys": ["File\u2028Path\u2029\u0085"],
+                },
+                ensure_ascii=False,
+            ),
+        )
+    )
+    assert _reported_conversation_id(stdout) == "conv-123"
+    assert _reported_view_file_arg_drift(stdout) == ["File\u2028Path\u2029\u0085"]
+
+
 def test_load_payload_round_trips_the_host_payload(tmp_path: Path) -> None:
     payload = {
         "prompt": "do the thing",
