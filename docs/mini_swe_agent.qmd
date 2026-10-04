@@ -26,6 +26,7 @@ The following options are supported for customizing the behavior of the agent:
 | `user` | User to execute {{< meta agent_name >}} as in the sandbox. |
 | `sandbox` | Sandbox environment name. |
 | `version` | Version of {{< meta agent_name >}} to use (see [Installation](#installation) below for details) |
+| `poll_timeout_recovery` | Seconds the model bridge keeps re-polling its proxy server after a poll of it times out, instead of failing the sample. Defaults to `None` (the bridge's own behavior). Requires an inspect-ai whose `sandbox_agent_bridge()` accepts `poll_timeout_recovery`. |
 
 : {tbl-colwidths=\[25,75\]}
 

@@ -128,6 +128,7 @@ class ClaudeCode(ACPAgent):
                 self._disallowed_tools, "WebSearch"
             ),
             port=port,
+            **self._bridge_recovery_args,
         ) as bridge:
             # Install node and claude-agent-acp in the sandbox.
             acp_binary, node_binary = await ensure_claude_code_acp_setup(

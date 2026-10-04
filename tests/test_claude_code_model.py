@@ -2,12 +2,21 @@
 
 Uses the keyless ``mockllm`` provider so these run without Docker or API keys
 (unlike ``tests/test_model_config_live.py``). Covers the per-role alias routing
-and ``model_config`` override logic in ``resolve_claude_code_models``.
+and ``model_config`` override logic in ``resolve_claude_code_models``, and the
+bridge's ``poll_timeout_recovery`` argument as ``claude_code()`` passes it.
 """
 
+import pytest
 from inspect_ai.agent._bridge.util import resolve_inspect_model
 from inspect_ai.model import Model
+from inspect_swe import claude_code
+from inspect_swe._claude_code import claude_code as claude_code_module
 from inspect_swe._claude_code.model import resolve_claude_code_models
+
+from tests.conftest import (
+    bridge_call_kwargs,
+    installed_bridge_accepts_poll_timeout_recovery,
+)
 
 
 def test_defaults_present_served_model_and_share_one_alias() -> None:
@@ -66,3 +75,30 @@ def test_transparent_proxy_presented_identity_resolves_via_alias() -> None:
     models = resolve_claude_code_models("mockllm/model", "claude-sonnet-4-5")
     resolved = resolve_inspect_model(models.presented, models.aliases, None)
     assert resolved.name == "model"
+
+
+def test_unset_poll_timeout_recovery_is_not_passed_to_the_bridge() -> None:
+    # an inspect-ai whose bridge predates the parameter must keep working
+    with installed_bridge_accepts_poll_timeout_recovery(False):
+        kwargs = bridge_call_kwargs(
+            claude_code_module, claude_code(model="mockllm/model")
+        )
+    assert "poll_timeout_recovery" not in kwargs
+
+
+def test_poll_timeout_recovery_is_passed_to_the_bridge() -> None:
+    with installed_bridge_accepts_poll_timeout_recovery(True):
+        agent = claude_code(model="mockllm/model", poll_timeout_recovery=900)
+    kwargs = bridge_call_kwargs(claude_code_module, agent)
+    assert kwargs["poll_timeout_recovery"] == 900
+
+
+def test_poll_timeout_recovery_unsupported_by_the_bridge_fails_construction() -> None:
+    with (
+        installed_bridge_accepts_poll_timeout_recovery(False),
+        pytest.raises(
+            RuntimeError,
+            match=r"sandbox_agent_bridge\(\) accepts poll_timeout_recovery",
+        ),
+    ):
+        claude_code(model="mockllm/model", poll_timeout_recovery=900)

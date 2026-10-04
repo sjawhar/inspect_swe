@@ -28,6 +28,7 @@ from inspect_swe._util.mcp_ready import (
     wait_for_mcp_endpoints,
 )
 from inspect_swe._util.messages import build_user_prompt
+from inspect_swe._util.poll_timeout_recovery import poll_timeout_recovery_bridge_args
 from inspect_swe._util.sandbox import resolve_agent_cwd
 from inspect_swe._util.trace import trace
 
@@ -60,6 +61,8 @@ def opencode(
     sandbox: str | None = None,
     version: Literal["auto", "sandbox", "stable", "latest"] | str = "auto",
     debug: bool | None = None,
+    *,
+    poll_timeout_recovery: float | None = None,
 ) -> Agent:
     """OpenCode agent.
 
@@ -100,6 +103,12 @@ def opencode(
             - "stable"/"latest": Download and use the latest version
             - "x.x.x": Download and use a specific version
         debug: Trace all debug output.
+        poll_timeout_recovery: Seconds the model bridge keeps re-polling its
+            proxy server after a poll of it times out, instead of failing the
+            sample (`sandbox_agent_bridge(poll_timeout_recovery=...)`). Defaults
+            to `None`, which leaves the bridge's own behavior unchanged. Setting
+            it requires an inspect-ai whose `sandbox_agent_bridge` accepts
+            `poll_timeout_recovery`, and otherwise raises `RuntimeError`.
     """
     # resolve centaur
     if centaur is True:
@@ -121,6 +130,8 @@ def opencode(
         opencode_model.split("/", 1)[0] if "/" in opencode_model else "anthropic"
     )
 
+    bridge_recovery_args = poll_timeout_recovery_bridge_args(poll_timeout_recovery)
+
     async def execute(state: AgentState) -> AgentState:
         # determine port (use new port for each execution of agent on sample)
         MODEL_PORT = "opencode_model_port"
@@ -139,6 +150,7 @@ def opencode(
             # granted unconditionally to preserve today's behaviour; a grant is
             # inert unless the CLI declares a native web tool
             web_search=True,
+            **bridge_recovery_args,
         ) as bridge:
             # resolve sandbox
             sbox = sandbox_env(sandbox)

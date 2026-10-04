@@ -102,6 +102,7 @@ class CodexCli(ACPAgent):
             bridged_tools=self.bridged_tools or None,
             web_search=self._web_search != "disabled",
             port=port,
+            **self._bridge_recovery_args,
         ) as bridge:
             # Install node and codex-acp in the sandbox.
             acp_binary, node_binary = await ensure_codex_acp_setup(sbox, self.user)

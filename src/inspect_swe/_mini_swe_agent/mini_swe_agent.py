@@ -28,6 +28,7 @@ from .._util._async import is_callable_coroutine
 from .._util.agentwheel import AgentWheelSource, ensure_agent_wheel_installed
 from .._util.centaur import CentaurOptions, run_centaur
 from .._util.messages import build_user_prompt
+from .._util.poll_timeout_recovery import poll_timeout_recovery_bridge_args
 from .._util.sandbox import resolve_agent_cwd
 from .._util.trace import trace
 from .setup import (
@@ -67,6 +68,8 @@ def mini_swe_agent(
     sandbox: str | None = None,
     version: Literal["stable", "sandbox", "latest"] | str = "stable",
     debug: bool | None = None,
+    *,
+    poll_timeout_recovery: float | None = None,
 ) -> Agent:
     """mini-swe-agent agent.
 
@@ -107,6 +110,12 @@ def mini_swe_agent(
             - "latest": Download and install latest version from PyPI.
             - "x.x.x": Install and use a specific version.
         debug: Trace all debug output.
+        poll_timeout_recovery: Seconds the model bridge keeps re-polling its
+            proxy server after a poll of it times out, instead of failing the
+            sample (`sandbox_agent_bridge(poll_timeout_recovery=...)`). Defaults
+            to `None`, which leaves the bridge's own behavior unchanged. Setting
+            it requires an inspect-ai whose `sandbox_agent_bridge` accepts
+            `poll_timeout_recovery`, and otherwise raises `RuntimeError`.
     """
     # validate version before anything else
     validate_version(version)
@@ -120,6 +129,8 @@ def mini_swe_agent(
 
     # resolve attempts
     attempts = AgentAttempts(attempts) if isinstance(attempts, int) else attempts
+
+    bridge_recovery_args = poll_timeout_recovery_bridge_args(poll_timeout_recovery)
 
     async def execute(state: AgentState) -> AgentState:
         # determine port (use new port for each execution of agent on sample)
@@ -140,6 +151,7 @@ def mini_swe_agent(
             retry_refusals=retry_refusals,
             compaction=compaction,
             port=port,
+            **bridge_recovery_args,
         ) as bridge:
             # resolve sandbox
             sbox = sandbox_env(sandbox)

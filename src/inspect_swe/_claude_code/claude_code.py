@@ -50,6 +50,7 @@ from inspect_swe._util.mcp_ready import (
     wait_for_mcp_endpoints,
 )
 from inspect_swe._util.path import join_path
+from inspect_swe._util.poll_timeout_recovery import poll_timeout_recovery_bridge_args
 from inspect_swe._util.websearch import web_search_tool_disallowed
 
 from .._util._async import is_callable_coroutine
@@ -148,6 +149,8 @@ def claude_code(
     replace_system_prompt: str | None = None,
     allowlist_mcp_tools: bool = True,
     allowlist_bridged_tools: bool = True,
+    *,
+    poll_timeout_recovery: float | None = None,
     **deprecated_args: Unpack[ClaudeCodeDeprecatedArgs],
 ) -> Agent:
     """Claude Code agent.
@@ -261,6 +264,12 @@ def claude_code(
             bridged call is never reviewed. Left `True` under `"auto"`, a run
             whose entire tool surface is bridged produces ZERO adjudications and
             looks clean while being wholly unreviewed.
+        poll_timeout_recovery: Seconds the model bridge keeps re-polling its
+            proxy server after a poll of it times out, instead of failing the
+            sample (`sandbox_agent_bridge(poll_timeout_recovery=...)`). Defaults
+            to `None`, which leaves the bridge's own behavior unchanged. Setting
+            it requires an inspect-ai whose `sandbox_agent_bridge` accepts
+            `poll_timeout_recovery`, and otherwise raises `RuntimeError`.
         **deprecated_args: Supports the deprecated `auto_mode` argument. Set
             `auto_mode=True` maps to `permission_mode="auto"`.
     """
@@ -290,6 +299,8 @@ def claude_code(
             "denied without prompting instead of being adjudicated by Claude "
             "Code's classifier, so the eval would complete toolless."
         )
+
+    bridge_recovery_args = poll_timeout_recovery_bridge_args(poll_timeout_recovery)
 
     # allocate session_id once per agent instance so that all calls to execute()
     # for the same sample share the same session. this enables --resume <id> to
@@ -344,6 +355,7 @@ def claude_code(
                 ),
                 model_event_sink=consumer,
                 checkpointer=cp,
+                **bridge_recovery_args,
             ) as bridge,
         ):
             if cp.attempt == "resume_for_scoring":

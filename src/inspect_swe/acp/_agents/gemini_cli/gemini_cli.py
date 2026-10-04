@@ -79,6 +79,7 @@ class GeminiCli(ACPAgent):
             bridged_tools=self.bridged_tools or None,
             web_search=self._web_search,
             port=port,
+            **self._bridge_recovery_args,
         ) as bridge:
             # Install node and gemini CLI in the sandbox.
             gemini_binary, node_binary = await ensure_gemini_cli_setup(

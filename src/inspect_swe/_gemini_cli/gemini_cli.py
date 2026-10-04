@@ -29,6 +29,7 @@ from inspect_swe._util.mcp_ready import (
 )
 from inspect_swe._util.messages import build_user_prompt
 from inspect_swe._util.path import join_path
+from inspect_swe._util.poll_timeout_recovery import poll_timeout_recovery_bridge_args
 from inspect_swe._util.sandbox import resolve_agent_cwd
 from inspect_swe._util.trace import trace
 
@@ -61,6 +62,8 @@ def gemini_cli(
     sandbox: str | None = None,
     version: Literal["auto", "sandbox", "stable", "latest"] | str = "auto",
     debug: bool | None = None,
+    *,
+    poll_timeout_recovery: float | None = None,
 ) -> Agent:
     """Gemini CLI agent.
 
@@ -101,6 +104,12 @@ def gemini_cli(
             - "stable"/"latest": Download and use the latest version
             - "x.x.x": Download and use a specific version
         debug: Trace all debug output.
+        poll_timeout_recovery: Seconds the model bridge keeps re-polling its
+            proxy server after a poll of it times out, instead of failing the
+            sample (`sandbox_agent_bridge(poll_timeout_recovery=...)`). Defaults
+            to `None`, which leaves the bridge's own behavior unchanged. Setting
+            it requires an inspect-ai whose `sandbox_agent_bridge` accepts
+            `poll_timeout_recovery`, and otherwise raises `RuntimeError`.
     """
     # resolve centaur
     if centaur is True:
@@ -114,6 +123,8 @@ def gemini_cli(
 
     # resolve attempts
     attempts = AgentAttempts(attempts) if isinstance(attempts, int) else attempts
+
+    bridge_recovery_args = poll_timeout_recovery_bridge_args(poll_timeout_recovery)
 
     async def execute(state: AgentState) -> AgentState:
         # determine port (use new port for each execution of agent on sample)
@@ -131,6 +142,7 @@ def gemini_cli(
             port=port,
             bridged_tools=bridged_tools,
             web_search=web_search,
+            **bridge_recovery_args,
         ) as bridge:
             # resolve sandbox
             sbox = sandbox_env(sandbox)

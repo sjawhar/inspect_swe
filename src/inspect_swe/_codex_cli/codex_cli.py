@@ -43,6 +43,7 @@ from inspect_swe._util.mcp_ready import (
 )
 from inspect_swe._util.messages import build_user_prompt, collect_user_images
 from inspect_swe._util.path import join_path
+from inspect_swe._util.poll_timeout_recovery import poll_timeout_recovery_bridge_args
 from inspect_swe._util.sandbox import resolve_agent_cwd, sandbox_exec
 from inspect_swe._util.toml import to_toml
 from inspect_swe._util.trace import trace
@@ -122,6 +123,8 @@ def codex_cli(
     approval_policy: CodexApprovalPolicy = "never",
     network_access: bool = True,
     approve_static_mcp_tools: bool = False,
+    *,
+    poll_timeout_recovery: float | None = None,
     **deprecated_args: Unpack[CodexDeprecatedArgs],
 ) -> Agent:
     """Codex CLI.
@@ -255,6 +258,12 @@ def codex_cli(
             `auto_review=True`: that macro's effective policy is `"on-request"`,
             never `"never"`, so the override this option applies would be
             silently unreachable.
+        poll_timeout_recovery: Seconds the model bridge keeps re-polling its
+            proxy server after a poll of it times out, instead of failing the
+            sample (`sandbox_agent_bridge(poll_timeout_recovery=...)`). Defaults
+            to `None`, which leaves the bridge's own behavior unchanged. Setting
+            it requires an inspect-ai whose `sandbox_agent_bridge` accepts
+            `poll_timeout_recovery`, and otherwise raises `RuntimeError`.
         **deprecated_args: Deprecated compatibility arguments.
     """
     # resolve centaur
@@ -352,6 +361,8 @@ def codex_cli(
                 "config_overrides={'approvals_reviewer': ...}."
             )
 
+    bridge_recovery_args = poll_timeout_recovery_bridge_args(poll_timeout_recovery)
+
     async def execute(state: AgentState) -> AgentState:
         # determine port (use new port for each execution of agent on sample)
         MODEL_PORT = "codex_cli_model_port"
@@ -385,6 +396,7 @@ def codex_cli(
                 web_search=effective_web_search != "disabled",
                 model_event_sink=consumer,
                 checkpointer=cp,
+                **bridge_recovery_args,
             ) as bridge,
         ):
             if cp.attempt == "resume_for_scoring":

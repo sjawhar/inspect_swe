@@ -25,6 +25,7 @@ from inspect_swe._util.mcp_ready import (
     DEFAULT_MCP_READY_TIMEOUT,
     wait_for_mcp_endpoints,
 )
+from inspect_swe._util.poll_timeout_recovery import poll_timeout_recovery_bridge_args
 
 from .client import ACPError, acp_connection, format_acp_failure
 
@@ -65,6 +66,13 @@ class ACPAgentParams(TypedDict, total=False):
         sandbox: Sandbox environment name.
         mcp_ready_timeout: Seconds to wait for bridged MCP endpoints to serve
             tools before the agent launch errors.
+        poll_timeout_recovery: Seconds the model bridge keeps re-polling its
+            proxy server after a poll of it times out, instead of failing the
+            sample (``sandbox_agent_bridge(poll_timeout_recovery=...)``).
+            Defaults to ``None``, which leaves the bridge's own behavior
+            unchanged. Setting it requires an inspect-ai whose
+            ``sandbox_agent_bridge`` accepts ``poll_timeout_recovery``, and
+            otherwise raises ``RuntimeError``.
     """
 
     model: str | Model | None
@@ -79,6 +87,7 @@ class ACPAgentParams(TypedDict, total=False):
     user: str | None
     sandbox: str | None
     mcp_ready_timeout: float
+    poll_timeout_recovery: float | None
 
 
 class ACPAgent(Agent):
@@ -120,6 +129,9 @@ class ACPAgent(Agent):
             DEFAULT_MCP_READY_TIMEOUT
             if mcp_ready_timeout is None
             else mcp_ready_timeout
+        )
+        self._bridge_recovery_args = poll_timeout_recovery_bridge_args(
+            kwargs.get("poll_timeout_recovery")
         )
 
         self.model_map: dict[str, str | Model] = self._build_model_map()

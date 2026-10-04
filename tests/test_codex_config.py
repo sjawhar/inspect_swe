@@ -5,6 +5,7 @@ from inspect_ai.agent._bridge.util import resolve_inspect_model
 from inspect_ai.model import Model, get_model
 from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
 from inspect_swe import codex_cli, interactive_codex_cli
+from inspect_swe._codex_cli import codex_cli as codex_cli_module
 from inspect_swe._codex_cli.config import (
     GUARDIAN_MODEL_SLUG,
     MCP_STARTUP_TIMEOUT_SEC,
@@ -29,6 +30,11 @@ from inspect_swe._codex_cli.config import (
     validate_codex_bool_arg,
 )
 from inspect_swe._util.toml import to_toml
+
+from tests.conftest import (
+    bridge_call_kwargs,
+    installed_bridge_accepts_poll_timeout_recovery,
+)
 
 
 def test_codex_config_defaults() -> None:
@@ -696,3 +702,30 @@ def test_codex_mcp_servers_toml_gates_on_force_approve() -> None:
         == "approve"
     )
     assert bridged_toml["mcp_servers.bridged-tools"]["required"] is True
+
+
+def test_codex_unset_poll_timeout_recovery_is_not_passed_to_the_bridge() -> None:
+    # an inspect-ai whose bridge predates the parameter must keep working
+    with installed_bridge_accepts_poll_timeout_recovery(False):
+        kwargs = bridge_call_kwargs(codex_cli_module, codex_cli())
+    assert "poll_timeout_recovery" not in kwargs
+
+
+def test_codex_poll_timeout_recovery_is_passed_to_the_bridge() -> None:
+    with installed_bridge_accepts_poll_timeout_recovery(True):
+        agent = codex_cli(poll_timeout_recovery=900)
+    kwargs = bridge_call_kwargs(codex_cli_module, agent)
+    assert kwargs["poll_timeout_recovery"] == 900
+
+
+def test_codex_poll_timeout_recovery_unsupported_by_the_bridge_fails_construction() -> (
+    None
+):
+    with (
+        installed_bridge_accepts_poll_timeout_recovery(False),
+        pytest.raises(
+            RuntimeError,
+            match=r"sandbox_agent_bridge\(\) accepts poll_timeout_recovery",
+        ),
+    ):
+        codex_cli(poll_timeout_recovery=900)
