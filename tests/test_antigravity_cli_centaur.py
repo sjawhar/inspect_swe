@@ -7,6 +7,7 @@ unit while asserting the session that reaches that boundary.
 
 import asyncio
 import importlib
+import inspect
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from inspect_ai.agent import AgentState
 from inspect_ai.agent._human.commands.command import HumanAgentCommand
 from inspect_ai.model import ChatMessageUser
 from inspect_ai.util import SandboxEnvironment
+from inspect_swe._util import poll_timeout_recovery
 from inspect_swe._util.centaur import CentaurOptions, CentaurSession, CommandsFilter
 
 
@@ -278,3 +280,95 @@ def test_antigravity_centaur_wrapper_preserves_ready_session_and_invocation(
 
     assert result is bridge_state
     assert lifecycle == ["entered", "exited"]
+
+
+class _BridgeEntered(Exception):
+    """Raised by the stand-in bridge once the factory opens it."""
+
+
+def _bridge_kwargs(
+    monkeypatch: pytest.MonkeyPatch, poll_timeout_recovery: float | None
+) -> dict[str, object]:
+    """Run the factory until it opens its bridge; return that call's kwargs."""
+    module = importlib.import_module("inspect_swe._antigravity_cli.antigravity_cli")
+    calls: list[dict[str, object]] = []
+
+    @asynccontextmanager
+    async def bridge_context(
+        state: AgentState, **kwargs: object
+    ) -> AsyncIterator[SimpleNamespace]:
+        calls.append(kwargs)
+        raise _BridgeEntered()
+        yield
+
+    sample_store = _Store()
+    monkeypatch.setattr(module, "store", lambda: sample_store)
+    monkeypatch.setattr(module, "sandbox_agent_bridge", bridge_context)
+    agent = module.antigravity_cli(poll_timeout_recovery=poll_timeout_recovery)
+    with pytest.raises(_BridgeEntered):
+        asyncio.run(agent(AgentState(messages=[ChatMessageUser(content="Hi.")])))
+    assert len(calls) == 1
+    return calls[0]
+
+
+def _bridge_with_poll_timeout_recovery(
+    state: AgentState | None = None,
+    *,
+    port: int = 13131,
+    poll_timeout_recovery: float | None = None,
+) -> None:
+    raise AssertionError("signature stand-in; never called")
+
+
+def _bridge_without_poll_timeout_recovery(
+    state: AgentState | None = None,
+    *,
+    port: int = 13131,
+) -> None:
+    raise AssertionError("signature stand-in; never called")
+
+
+def test_antigravity_cli_unset_poll_timeout_recovery_is_not_passed_to_the_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # an inspect-ai whose bridge predates the parameter must keep working
+    monkeypatch.setattr(
+        poll_timeout_recovery,
+        "sandbox_agent_bridge",
+        _bridge_without_poll_timeout_recovery,
+    )
+    assert "poll_timeout_recovery" not in _bridge_kwargs(monkeypatch, None)
+
+
+def test_antigravity_cli_poll_timeout_recovery_is_passed_to_the_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        poll_timeout_recovery,
+        "sandbox_agent_bridge",
+        _bridge_with_poll_timeout_recovery,
+    )
+    assert _bridge_kwargs(monkeypatch, 900)["poll_timeout_recovery"] == 900
+
+
+def test_antigravity_cli_poll_timeout_recovery_unsupported_fails_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = importlib.import_module("inspect_swe._antigravity_cli.antigravity_cli")
+    monkeypatch.setattr(
+        poll_timeout_recovery,
+        "sandbox_agent_bridge",
+        _bridge_without_poll_timeout_recovery,
+    )
+    with pytest.raises(
+        RuntimeError, match=r"sandbox_agent_bridge\(\) accepts poll_timeout_recovery"
+    ):
+        module.antigravity_cli(poll_timeout_recovery=900)
+
+
+def test_antigravity_cli_poll_timeout_recovery_is_the_last_parameter() -> None:
+    module = importlib.import_module("inspect_swe._antigravity_cli.antigravity_cli")
+    last = list(inspect.signature(module.antigravity_cli).parameters.values())[-1]
+    assert last.name == "poll_timeout_recovery"
+    assert last.kind is inspect.Parameter.KEYWORD_ONLY
+    assert last.default is None

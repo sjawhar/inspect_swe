@@ -27,6 +27,7 @@ from .._util.centaur import CentaurOptions, CentaurSession, CommandsFilter, run_
 from .._util.mcp_ready import DEFAULT_MCP_READY_TIMEOUT, wait_for_mcp_endpoints
 from .._util.messages import build_user_prompt
 from .._util.path import join_path
+from .._util.poll_timeout_recovery import poll_timeout_recovery_bridge_args
 from .._util.sandbox import (
     DEFAULT_CLI_EXEC_TIMEOUT_SECONDS,
     resolve_agent_cwd,
@@ -79,6 +80,7 @@ def antigravity_cli(
     model_resolver: ModelResolver | None = None,
     accumulate_conversations: bool = False,
     exec_timeout: float | None = DEFAULT_CLI_EXEC_TIMEOUT_SECONDS,
+    poll_timeout_recovery: float | None = None,
 ) -> Agent:
     """Antigravity CLI agent.
 
@@ -141,6 +143,12 @@ def antigravity_cli(
         exec_timeout: Wall-time limit in seconds for each unattended Antigravity
             invocation. Defaults to 30 minutes; an invocation that exceeds it is
             terminated. `0` times out immediately; `None` disables the deadline.
+        poll_timeout_recovery: Seconds the model bridge keeps re-polling its
+            proxy server after a poll of it times out, instead of failing the
+            sample (`sandbox_agent_bridge(poll_timeout_recovery=...)`). Defaults
+            to `None`, which leaves the bridge's own behavior unchanged. Setting
+            it requires an inspect-ai whose `sandbox_agent_bridge` accepts
+            `poll_timeout_recovery`, and otherwise raises `RuntimeError`.
     """
     # resolve centaur
     if centaur is True:
@@ -154,6 +162,8 @@ def antigravity_cli(
 
     # resolve attempts
     attempts = AgentAttempts(attempts) if isinstance(attempts, int) else attempts
+
+    bridge_recovery_args = poll_timeout_recovery_bridge_args(poll_timeout_recovery)
 
     async def execute(state: AgentState) -> AgentState:
         # determine port (use new port for each execution of agent on sample)
@@ -172,6 +182,7 @@ def antigravity_cli(
             bridged_tools=bridged_tools,
             model_resolver=model_resolver,
             accumulate_conversations=accumulate_conversations,
+            **bridge_recovery_args,
         ) as bridge:
             # resolve sandbox
             sbox = sandbox_env(sandbox)
