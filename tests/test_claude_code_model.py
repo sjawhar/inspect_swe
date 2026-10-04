@@ -13,7 +13,7 @@ from inspect_swe import claude_code
 from inspect_swe._claude_code import claude_code as claude_code_module
 from inspect_swe._claude_code.model import resolve_claude_code_models
 
-from tests.conftest import (
+from tests.bridge_stand_ins import (
     bridge_call_kwargs,
     installed_bridge_accepts_poll_timeout_recovery,
 )

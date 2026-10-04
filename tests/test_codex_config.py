@@ -31,7 +31,7 @@ from inspect_swe._codex_cli.config import (
 )
 from inspect_swe._util.toml import to_toml
 
-from tests.conftest import (
+from tests.bridge_stand_ins import (
     bridge_call_kwargs,
     installed_bridge_accepts_poll_timeout_recovery,
 )
