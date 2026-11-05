@@ -19,21 +19,21 @@ from inspect_swe._claude_code.claude_code import (
 
 def test_default_registers_and_allowlists_explicit_mcp_tools() -> None:
     server = MCPServerConfig(
-        type="http", name="taiga-mcp", tools=["list_files", "read_file"]
+        type="http", name="example-mcp", tools=["list_files", "read_file"]
     )
 
     mcp_config_cmds, allowed_tools = resolve_mcp_servers([server])
 
     assert mcp_config_cmds[0] == "--mcp-config"
     assert allowed_tools == [
-        "mcp__taiga-mcp__list_files",
-        "mcp__taiga-mcp__read_file",
+        "mcp__example-mcp__list_files",
+        "mcp__example-mcp__read_file",
     ]
 
 
 def test_disabling_static_mcp_allowlist_keeps_servers_registered() -> None:
     server = MCPServerConfig(
-        type="http", name="taiga-mcp", tools=["list_files", "read_file"]
+        type="http", name="example-mcp", tools=["list_files", "read_file"]
     )
 
     mcp_config_cmds, _ = resolve_mcp_servers([server])
@@ -57,12 +57,12 @@ def test_disabling_static_mcp_allowlist_preserves_bridged_allowlist() -> None:
 
 
 def test_all_tools_wildcard_uses_double_underscore_before_glob() -> None:
-    server = MCPServerConfig(type="http", name="taiga-mcp", tools="all")
+    server = MCPServerConfig(type="http", name="example-mcp", tools="all")
 
     mcp_config_cmds, allowed_tools = resolve_mcp_servers([server])
 
     assert mcp_config_cmds[0] == "--mcp-config"
-    assert allowed_tools == ["mcp__taiga-mcp__*"]
+    assert allowed_tools == ["mcp__example-mcp__*"]
 
 
 def test_deprecated_auto_mode_resolves_to_auto_permission_mode() -> None:
